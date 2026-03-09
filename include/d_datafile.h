@@ -122,7 +122,7 @@ typedef void* (*ALLEGRO_DATAFILE_OBJECT_LOADER_ARGS_FUNC)(ALLEGRO_FILE* file, co
  */
 typedef struct ALLEGRO_DATAFILE_TYPE_VTABLE
 {
-	ALLEGRO_DATAFILE_TYPE_NAMER_FUNC name;        /**< Function to get the type name */
+	ALLEGRO_DATAFILE_TYPE_NAMER_FUNC name;        /**< Function to get the object name */
 	ALLEGRO_DATAFILE_TYPE_LOADER_FUNC load;       /**< Function to load the object */
 	ALLEGRO_DATAFILE_TYPE_SAVER_FUNC save;        /**< Function to save the object */
 	ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC destroy; /**< Function to destroy the object */
@@ -149,7 +149,7 @@ typedef struct ALLEGRO_DATA
  */
 typedef struct ALLEGRO_BITMAP_ARRAY
 {
-	ALLEGRO_BITMAP* bitmap;        /**< The source bitmap containing all sub-bitmaps */
+	ALLEGRO_BITMAP* bitmap;        /**< The source bitmap containing the parent bitmap */
 	ALLEGRO_BITMAP** sub_bitmap;   /**< Array of pointers to sub-bitmap regions */
 	size_t count;                  /**< Number of sub-bitmaps in the array */
 	int32_t width;                 /**< Width of each sub-bitmap in pixels */
@@ -233,6 +233,18 @@ ALLEGRO_DATAFILE* al_create_datafile(void);
 ALLEGRO_DATAFILE* al_load_datafile(const char* filename);
 
 /**
+ * @brief Saves a datafile to disk.
+ * 
+ * The datafile will be saved in a compressed format. If the file already
+ * exists, it will be overwritten.
+ * 
+ * @param filename Path to the file where the datafile should be saved.
+ * @param datafile Pointer to the datafile to save.
+ * @return 0 on success, -1 on failure.
+ */
+int32_t al_save_datafile(const char* filename, const ALLEGRO_DATAFILE* datafile);
+
+/**
  * @brief Destroys a datafile and frees all associated resources.
  * 
  * This function will call the appropriate destroy callback for each object
@@ -255,7 +267,7 @@ size_t al_get_datafile_object_count(const ALLEGRO_DATAFILE* datafile);
  * @param index Index of the object (0-based).
  * @return Pointer to the object's name string, or NULL on failure.
  */
-const char* al_get_datafile_name(const ALLEGRO_DATAFILE* datafile, size_t index);
+const char* al_get_datafile_object_name(const ALLEGRO_DATAFILE* datafile, size_t index);
 
 /**
  * @brief Adds an object to a datafile.
@@ -311,7 +323,7 @@ int32_t al_add_datafile_file_object_args(ALLEGRO_DATAFILE** datafile, uint32_t t
  */
 typedef struct ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA
 {
-	const char* identifier;  /**< File format identifier (e.g., ".png") may be NULL to auto-detect bitmap type*/
+	const char* identifier;  /**< File format identifier (e.g., ".png"). May be NULL to auto-detect bitmap type*/
 	int32_t width;           /**< Width of each sub-bitmap cell */
 	int32_t height;          /**< Height of each sub-bitmap cell */
 } ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA;
@@ -324,7 +336,7 @@ typedef struct ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA
  */
 typedef struct ALLEGRO_DATAFILE_BITMAP_FONT_DATA
 {
-	const char* identifier;  /**< File format identifier (e.g., ".png") may be NULL to auto-detect bitmap type*/
+	const char* identifier;  /**< File format identifier (e.g., ".png"). May be NULL to auto-detect bitmap type*/
 	int range_count;         /**< Number of character ranges */
 	int ranges[];            /**< Flexible array of range pairs (start, end) */
 } ALLEGRO_DATAFILE_BITMAP_FONT_DATA;
@@ -352,7 +364,7 @@ typedef struct ALLEGRO_DATAFILE_TTF_FONT_DATA
  * @brief Loads a bitmap from an open file handle.
  * 
  * @param file Open file handle positioned at the bitmap data.
- * @param identifier File format identifier (e.g., ".png", ".bmp"). May be NULL to auto-detect bitmap type*/
+ * @param identifier File format identifier (e.g., ".png", ".bmp"). May be NULL to auto-detect bitmap type
  * @return Pointer to the loaded bitmap, or NULL on failure.
  */
 ALLEGRO_BITMAP* al_load_datafile_bitmap_f(ALLEGRO_FILE* file, const char* identifier);
@@ -373,7 +385,7 @@ ALLEGRO_BITMAP_ARRAY* al_load_datafile_bitmap_array_f(ALLEGRO_FILE* file, const 
  * @brief Loads an audio sample from an open file handle.
  * 
  * @param file Open file handle positioned at the sample data.
- * @param identifier File format identifier (e.g., ".wav", ".ogg"). May be NULL to auto-detect sample type*/
+ * @param identifier File format identifier (e.g., ".wav", ".ogg"). May be NULL to auto-detect sample type
  * @return Pointer to the loaded sample, or NULL on failure.
  */
 ALLEGRO_SAMPLE* al_load_datafile_sample_f(ALLEGRO_FILE* file, const char* identifier);
@@ -2576,6 +2588,44 @@ ALLEGRO_DATAFILE* al_load_datafile(const char* filename)
 	return datafile;
 }
 
+int32_t al_save_datafile(const char* filename, const ALLEGRO_DATAFILE* datafile)
+{
+	const ALLEGRO_FILE_INTERFACE* previous_interface = NULL;
+	ALLEGRO_FILE* file = NULL;
+	int32_t result = -1;
+	
+	if (filename == NULL)
+	{
+		DO_LOG("Filename pointer is null.");
+		return -1;
+	}
+	
+	if (datafile == NULL)
+	{
+		DO_LOG("Datafile pointer is null.");
+		return -1;
+	}
+	
+	const ALLEGRO_DATAFILE_HEADER* header = (const ALLEGRO_DATAFILE_HEADER*)((const char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
+	_al_datafile_assert_signature(header);
+	
+	previous_interface = al_get_new_file_interface();
+	gz_set_interface();
+	
+	file = al_fopen(filename, "wb");
+	
+	if (file)
+	{
+		result = _al_datafile_file_save(file, datafile);
+	}
+	
+	al_fclose(file);
+	
+	al_set_new_file_interface(previous_interface);
+
+	return result;
+}
+
 void al_destroy_datafile(ALLEGRO_DATAFILE* datafile)
 {
 	if (datafile)
@@ -2596,10 +2646,11 @@ size_t al_get_datafile_object_count(const ALLEGRO_DATAFILE* datafile)
 
 	const ALLEGRO_DATAFILE_HEADER* header = (const ALLEGRO_DATAFILE_HEADER*)((const char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
 	_al_datafile_assert_signature(header);
+
 	return header->count;
 }
 
-const char* al_get_datafile_name(const ALLEGRO_DATAFILE* datafile, size_t index)
+const char* al_get_datafile_object_name(const ALLEGRO_DATAFILE* datafile, size_t index)
 {
 	if (!datafile)
 	{
