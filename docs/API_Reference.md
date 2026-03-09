@@ -497,6 +497,25 @@ if (!datafile) {
 
 ---
 
+### al_save_datafile
+```c
+bool al_save_datafile(const ALLEGRO_DATAFILE* datafile, const char* filename);
+```
+**Description:** Saves a datafile to disk. The datafile will be compressed using zlib.
+**Parameters:**
+- `datafile` - Pointer to the datafile to save
+- `filename` - Path to the file to save the datafile to
+
+**Returns:** true on success, false on failure.
+**Example:**
+```c
+if (!al_save_datafile(datafile, "assets.dat")) {
+    fprintf(stderr, "Failed to save datafile\n");
+}
+```
+
+---
+
 ### al_destroy_datafile
 ```c
 void al_destroy_datafile(ALLEGRO_DATAFILE* datafile);
