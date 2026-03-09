@@ -311,7 +311,7 @@ int32_t al_add_datafile_file_object_args(ALLEGRO_DATAFILE** datafile, uint32_t t
  */
 typedef struct ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA
 {
-	const char* identifier;  /**< File format identifier (e.g., ".png") */
+	const char* identifier;  /**< File format identifier (e.g., ".png") may be NULL to auto-detect bitmap type*/
 	int32_t width;           /**< Width of each sub-bitmap cell */
 	int32_t height;          /**< Height of each sub-bitmap cell */
 } ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA;
@@ -324,7 +324,7 @@ typedef struct ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA
  */
 typedef struct ALLEGRO_DATAFILE_BITMAP_FONT_DATA
 {
-	const char* identifier;  /**< File format identifier (e.g., ".png") */
+	const char* identifier;  /**< File format identifier (e.g., ".png") may be NULL to auto-detect bitmap type*/
 	int range_count;         /**< Number of character ranges */
 	int ranges[];            /**< Flexible array of range pairs (start, end) */
 } ALLEGRO_DATAFILE_BITMAP_FONT_DATA;
@@ -352,7 +352,7 @@ typedef struct ALLEGRO_DATAFILE_TTF_FONT_DATA
  * @brief Loads a bitmap from an open file handle.
  * 
  * @param file Open file handle positioned at the bitmap data.
- * @param identifier File format identifier (e.g., ".png", ".bmp").
+ * @param identifier File format identifier (e.g., ".png", ".bmp"). May be NULL to auto-detect bitmap type*/
  * @return Pointer to the loaded bitmap, or NULL on failure.
  */
 ALLEGRO_BITMAP* al_load_datafile_bitmap_f(ALLEGRO_FILE* file, const char* identifier);
@@ -373,7 +373,7 @@ ALLEGRO_BITMAP_ARRAY* al_load_datafile_bitmap_array_f(ALLEGRO_FILE* file, const 
  * @brief Loads an audio sample from an open file handle.
  * 
  * @param file Open file handle positioned at the sample data.
- * @param identifier File format identifier (e.g., ".wav", ".ogg").
+ * @param identifier File format identifier (e.g., ".wav", ".ogg"). May be NULL to auto-detect sample type*/
  * @return Pointer to the loaded sample, or NULL on failure.
  */
 ALLEGRO_SAMPLE* al_load_datafile_sample_f(ALLEGRO_FILE* file, const char* identifier);

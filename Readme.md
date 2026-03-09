@@ -648,7 +648,7 @@ typedef struct ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA {
 **Description:** Configuration data for loading bitmap arrays. This structure specifies how to divide a source bitmap into a grid of sub-bitmaps.
 
 **Members:**
-- `identifier` - File format identifier (e.g., ".png")
+- `identifier` - File format identifier (e.g., ".png"). May be NULL to auto-detect bitmap type.
 - `width` - Width of each sub-bitmap cell
 - `height` - Height of each sub-bitmap cell
 
@@ -674,7 +674,7 @@ typedef struct ALLEGRO_DATAFILE_BITMAP_FONT_DATA {
 **Description:** Configuration data for loading bitmap fonts. This structure specifies the character ranges to extract from a bitmap font image.
 
 **Members:**
-- `identifier` - File format identifier (e.g., ".png")
+- `identifier` - File format identifier (e.g., ".png"). May be NULL to auto-detect bitmap type.
 - `range_count` - Number of character ranges
 - `ranges` - Flexible array of range pairs (start, end)
 
@@ -729,7 +729,7 @@ ALLEGRO_BITMAP* al_load_datafile_bitmap_f(ALLEGRO_FILE* file, const char* identi
 
 **Parameters:**
 - `file` - Open file handle positioned at the bitmap data
-- `identifier` - File format identifier (e.g., ".png", ".bmp")
+- `identifier` - File format identifier (e.g., ".png", ".bmp"). May be NULL to auto-detect bitmap type.
 
 **Returns:** Pointer to the loaded bitmap, or NULL on failure.
 
@@ -773,7 +773,7 @@ ALLEGRO_SAMPLE* al_load_datafile_sample_f(ALLEGRO_FILE* file, const char* identi
 
 **Parameters:**
 - `file` - Open file handle positioned at the sample data
-- `identifier` - File format identifier (e.g., ".wav", ".ogg")
+- `identifier` - File format identifier (e.g., ".wav", ".ogg"). May be NULL to auto-detect sample type.
 
 **Returns:** Pointer to the loaded sample, or NULL on failure.
 
