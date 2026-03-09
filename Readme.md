@@ -1,2587 +1,955 @@
-#ifdef _DEBUG
-#define DO_LOG(format, ...) printf("Error: " format "\nFile: %s\nLine: %d\n", __VA_ARGS__, __FILE__, __LINE__)
-#else
-#define DO_LOG(format, ...)
-#endif
-
-ALLEGRO_DEBUG_CHANNEL("datafile")
-
-static const uint32_t ALLEGRO_DATAFILE_VERSION_INT = 0x00010000;
-static const size_t ALLEGRO_DATAFILE_INITIAL_CAPACITY = 8;
-static const size_t ALLEGRO_DATAFILE_GROWTH_FACTOR = 2;
-static const char* _DATA_BITMAP_IDENTIFIER = ".png";
-static const char* _DATA_SAMPLE_IDENTIFIER = ".wav";
-static const int32_t _DATA_MAX_FONT_RANGES = 256;
-static const char _DATAFILE_SIGNATURE[sizeof(size_t)] = { 0x86, 0xcd, 0x80, 0xac, 0x6a, 0xc3, 0x77, 0x76 };
-
-typedef struct ALLEGRO_DATAFILE_HEADER
-{
-	char signature[sizeof(size_t)];
-	size_t count;
-	size_t capacity;
-	ALLEGRO_USTR** names;
-} ALLEGRO_DATAFILE_HEADER;
-
-typedef struct ALLEGRO_DATAFILE_TYPE_NODE
-{
-	ALLEGRO_DATAFILE_TYPE_VTABLE vtable;
-	struct ALLEGRO_DATAFILE_TYPE_NODE* next;
-	uint32_t type;
-} ALLEGRO_DATAFILE_TYPE_NODE;
-
-// PACKFILE section begin
-static void* gz_fopen_wrapper(const char* path, const char* mode)
-{
-	void* gz = NULL;
-
-	if (!path)
-	{
-		DO_LOG("Invalid file path");
-		return NULL;
-	}
-
-	if (!mode)
-	{
-		DO_LOG("Invalid file mode");
-		return NULL;
-	}
-
-	gz = (void*)gzopen(path, mode);
-
-	return gz;
-}
-
-static bool gz_fclose_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return false;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return false;
-	}
-
-	return Z_OK == gzclose(gz);
-}
-
-static size_t gz_fread_wrapper(ALLEGRO_FILE* f_ptr, void* ptr, size_t size)
-{
-	gzFile gz = NULL;
-	int32_t byte_count = 0;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return false;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return false;
-	}
-
-	byte_count = gzread(gz, ptr, (uint32_t)size);
-
-	if (byte_count != size)
-	{
-		DO_LOG("Failed to read the expected number of bytes");
-		return 0;
-	}
-
-	return byte_count;
-}
-
-static size_t gz_fwrite_wrapper(ALLEGRO_FILE* f_ptr, const void* ptr, size_t size)
-{
-	gzFile gz = NULL;
-	int32_t byte_count = 0;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return false;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return false;
-	}
-
-	byte_count = gzwrite(gz, ptr, (uint32_t)size);
-
-	if (byte_count != size)
-	{
-		DO_LOG("Failed to write the expected number of bytes");
-		return 0;
-	}
-
-	return byte_count;
-}
-
-static bool gz_fflush_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-	int32_t result = Z_OK;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return false;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return false;
-	}
-
-	result = gzflush(gz, Z_SYNC_FLUSH);
-
-	return Z_OK == result;
-}
-
-static int64_t gz_ftell_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-	int64_t position = -1;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return -1;
-	}
-
-	position = gztell(gz);
-
-	return position;
-}
-
-static bool gz_fseek_wrapper(ALLEGRO_FILE* f_ptr, int64_t offset, int32_t whence)
-{
-	gzFile gz = NULL;
-	int64_t result = Z_OK;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return false;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return false;
-	}
-
-	result = gzseek(gz, offset, whence);
-
-	return (result != -1);
-}
-
-static bool gz_feof_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return false;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return false;
-	}
-
-	return gzeof(gz) != 0;
-}
-
-static int32_t gz_ferror_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-	int32_t errnum = 0;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return -1;
-	}
-
-	gzerror(gz, &errnum);
-
-	return errnum;
-}
-
-static const char* gz_ferrmsg_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return "Invalid file pointer";
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return "Invalid gzFile pointer";
-	}
-
-	return gzerror(gz, NULL);
-}
-
-static void gz_fclearerr_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return;
-	}
-
-	gzclearerr(gz);
-}
-static int32_t gz_fungetc_wrapper(ALLEGRO_FILE* f_ptr, int32_t c)
-{
-	gzFile gz = NULL;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return -1;
-	}
-
-	return gzungetc(c, gz);
-}
-
-static off_t gz_fsize_wrapper(ALLEGRO_FILE* f_ptr)
-{
-	gzFile gz = NULL;
-	int64_t current_pos = -1;
-	int64_t end_pos = -1;
-
-	if (!f_ptr)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	gz = (gzFile)al_get_file_userdata(f_ptr);
-
-	if (!gz)
-	{
-		DO_LOG("Invalid gzFile pointer");
-		return -1;
-	}
-
-	current_pos = gztell(gz);
-
-	if (current_pos == -1)
-	{
-		DO_LOG("Failed to get current position");
-		return -1;
-	}
-
-	end_pos = gzseek(gz, 0, ALLEGRO_SEEK_END);
-
-	if (end_pos == -1)
-	{
-		DO_LOG("Failed to get end position");
-		return -1;
-	}
-
-	if (gzseek(gz, (long)current_pos, ALLEGRO_SEEK_SET) == -1)
-	{
-		DO_LOG("Failed to restore current position");
-		return -1;
-	}
-
-	return (off_t)end_pos;
-}
-
-static void gz_set_interface(void)
-{
-	static const ALLEGRO_FILE_INTERFACE gz_interface =
-	{
-		gz_fopen_wrapper,
-		gz_fclose_wrapper,
-		gz_fread_wrapper,
-		gz_fwrite_wrapper,
-		gz_fflush_wrapper,
-		gz_ftell_wrapper,
-		gz_fseek_wrapper,
-		gz_feof_wrapper,
-		gz_ferror_wrapper,
-		gz_ferrmsg_wrapper,
-		gz_fclearerr_wrapper,
-		gz_fungetc_wrapper,
-		gz_fsize_wrapper
-	};
-
-	al_set_new_file_interface(&gz_interface);
-}
-// PACKFILE section end
-
-#ifdef ALLEGRO_BIG_ENDIAN
-static uint32_t _al_datafile_swap_uint32(uint32_t value)
-{
-	return ((value >> 24) & 0x000000FF) |
-		((value >> 8) & 0x0000FF00) |
-		((value << 8) & 0x00FF0000) |
-		((value << 24) & 0xFF000000);
-}
-
-static size_t _al_datafile_swap_size(size_t value)
-{
-	return ((value >> 56) & 0x00000000000000FFULL) |
-		((value >> 40) & 0x000000000000FF00ULL) |
-		((value >> 24) & 0x0000000000FF0000ULL) |
-		((value >> 8) & 0x00000000FF000000ULL) |
-		((value << 8) & 0x000000FF00000000ULL) |
-		((value << 24) & 0x0000FF0000000000ULL) |
-		((value << 40) & 0x00FF000000000000ULL) |
-		((value << 56) & 0xFF00000000000000ULL);
-}
-#endif
-
-static int32_t _al_datafile_read_uint(ALLEGRO_FILE* file, void* value, size_t size)
-{
-	size_t bytes_read = 0;
-
-	if (al_feof(file))
-	{
-		DO_LOG("End of file reached");
-		return -1;
-	}
-
-	bytes_read = al_fread(file, value, size);
-
-	if (bytes_read != size)
-	{
-		DO_LOG("Failed to read the expected number of bytes");
-		return -1;
-	}
-
-#ifdef ALLEGRO_BIG_ENDIAN
-	if (size == sizeof(uint32_t))
-	{
-		*(uint32_t*)value = _al_datafile_swap_uint32(*(uint32_t*)value);
-	}
-	else if (size == sizeof(size_t))
-	{
-		*(size_t*)value = _al_datafile_swap_size(*(size_t*)value);
-	}
-#endif
-
-	return 0;
-}
-
-static int32_t _al_datafile_write_uint(ALLEGRO_FILE* file, const void* value, size_t size)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (value == NULL)
-	{
-		DO_LOG("Invalid value pointer");
-		return -1;
-	}
-
-	if (size == sizeof(uint32_t))
-	{
-		uint32_t temp = *(const uint32_t*)value;
-
-#ifdef ALLEGRO_BIG_ENDIAN
-		temp = _al_datafile_swap_uint32(temp);
-#endif
-
-		if (al_fwrite(file, &temp, sizeof(uint32_t)) != sizeof(uint32_t))
-		{
-			DO_LOG("Failed to write uint32_t value");
-			return -1;
-		}
-
-	}
-	else if (size == sizeof(size_t))
-	{
-		size_t temp = *(const size_t*)value;
-
-#ifdef ALLEGRO_BIG_ENDIAN
-		temp = _al_datafile_swap_size(temp);
-#endif
-
-		if (al_fwrite(file, &temp, sizeof(size_t)) != sizeof(size_t))
-		{
-			DO_LOG("Failed to write size_t value");
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-static void _al_datafile_assert_signature(const ALLEGRO_DATAFILE_HEADER* header)
-{
-	if (header == NULL)
-	{
-		DO_LOG("Invalid header pointer");
-		return;
-	}
-
-	for (size_t i = 0; i < sizeof(header->signature); ++i)
-	{
-		ALLEGRO_ASSERT(header->signature[i] == _DATAFILE_SIGNATURE[i]);
-	}
-}
-
-static void _al_datafile_destroy_header(ALLEGRO_DATAFILE_HEADER* header)
-{
-	if (header == NULL)
-	{
-		DO_LOG("Invalid header pointer");
-		return;
-	}
-
-	if (header->names)
-	{
-		for (size_t i = 0; i < header->count; ++i)
-		{
-			if (header->names + i)
-			{
-				al_ustr_free(header->names[i]);
-			}
-		}
-		al_free(header->names);
-		header->names = NULL;
-	}
-
-	al_free(header);
-}
-
-// String functions
-
-static int32_t _al_datafile_write_string(ALLEGRO_FILE* file, const ALLEGRO_USTR* name)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (name == NULL)
-	{
-		DO_LOG("Invalid name pointer");
-		return -1;
-	}
-
-	size_t str_size = al_ustr_size(name);
-	const char* str_data = al_cstr(name);
-
-	if (_al_datafile_write_uint(file, &str_size, sizeof(size_t)) != 0)
-	{
-		DO_LOG("Failed to write string size");
-		return -1;
-	}
-
-	if (al_fwrite(file, str_data, str_size) != str_size)
-	{
-		DO_LOG("Failed to write string data");
-		return -1;
-	}
-
-	return 0;
-}
-
-static int32_t _al_datafile_read_string(ALLEGRO_FILE* file, ALLEGRO_USTR** name)
-{
-	size_t str_size = 0;
-
-	if (_al_datafile_read_uint(file, &str_size, sizeof(size_t)) != 0)
-	{
-		DO_LOG("Failed to read string size");
-		return -1;
-	}
-
-	if (str_size == 0) // Arbitrary limit to prevent excessive memory allocation
-	{
-		DO_LOG("Invalid string size");
-		return -1;
-	}
-
-	char* buffer = (char*)al_malloc(str_size);
-
-	if (buffer == NULL)
-	{
-		DO_LOG("Failed to allocate memory for string buffer");
-		return -1;
-	}
-
-	size_t bytes_read = al_fread(file, buffer, str_size);
-
-	if (bytes_read != str_size)
-	{
-		DO_LOG("Failed to read string data");
-		al_free(buffer);
-		return -1;
-	}
-
-	(*name) = al_ustr_new_from_buffer(buffer, str_size);
-
-	al_free(buffer);
-
-	if ((*name) == NULL)
-	{
-		DO_LOG("Failed to create string from buffer");
-		return -1;
-	}
-
-	return 0;
-}
-
-static ALLEGRO_DATAFILE_HEADER* _al_datafile_create_header(size_t capacity)
-{
-	size_t size = sizeof(ALLEGRO_DATAFILE_HEADER) + sizeof(ALLEGRO_DATAFILE) * capacity;
-	ALLEGRO_DATAFILE_HEADER* header = (ALLEGRO_DATAFILE_HEADER*)al_malloc(size);
-
-	if (header == NULL)
-	{
-		DO_LOG("Failed to allocate memory for datafile header");
-		return NULL;
-	}
-
-	header->count = 0;
-	header->capacity = capacity;
-	header->names = NULL;
-
-	for (size_t i = 0; i < sizeof(header->signature); ++i)
-	{
-		header->signature[i] = _DATAFILE_SIGNATURE[i];
-	}
-
-	for (size_t i = 0; i < header->capacity; ++i)
-	{
-		ALLEGRO_DATAFILE* object = (ALLEGRO_DATAFILE*)(header + 1) + i;
-		object->data = NULL;
-		object->type = ALLEGRO_DATAFILE_TYPE_UNDEFINED;
-	}
-
-	header->names = (ALLEGRO_USTR**)al_malloc(sizeof(ALLEGRO_USTR*) * capacity);
-
-	if (header->names == NULL)
-	{
-		DO_LOG("Failed to allocate memory for datafile name array");
-		al_free(header);
-		header = NULL;
-	}
-
-	for (size_t i = 0; i < header->capacity; ++i)
-	{
-		header->names[i] = NULL;
-	}
-
-	return header;
-}
-
-static ALLEGRO_DATAFILE_HEADER* _al_resize_datafile_header(ALLEGRO_DATAFILE_HEADER* header)
-{
-	if (header == NULL)
-	{
-		DO_LOG("Invalid header pointer");
-		return NULL;
-	}
-
-	size_t new_capacity = header->capacity * ALLEGRO_DATAFILE_GROWTH_FACTOR;
-	size_t size = sizeof(ALLEGRO_DATAFILE_HEADER) + sizeof(ALLEGRO_DATAFILE) * new_capacity;
-
-	ALLEGRO_DATAFILE_HEADER* new_header = (ALLEGRO_DATAFILE_HEADER*)al_realloc(header, size);
-
-	if (new_header == NULL)
-	{
-		DO_LOG("Failed to reallocate memory for datafile header");
-		return NULL;
-	}
-
-	for (size_t i = new_header->count; i < new_capacity; ++i)
-	{
-		ALLEGRO_DATAFILE* object = (ALLEGRO_DATAFILE*)(new_header + 1) + i;
-		object->data = NULL;
-		object->type = ALLEGRO_DATAFILE_TYPE_UNDEFINED;
-	}
-
-	ALLEGRO_USTR** new_names = (ALLEGRO_USTR**)al_realloc(new_header->names, sizeof(ALLEGRO_USTR*) * new_capacity);
-
-	if (new_names == NULL)
-	{
-		DO_LOG("Failed to reallocate memory for datafile name array");
-		al_free(new_header);
-		return NULL;
-	}
-
-	for (size_t i = new_header->count; i < new_capacity; ++i)
-	{
-		new_names[i] = NULL;
-	}
-
-	new_header->names = new_names;
-	new_header->capacity = new_capacity;
-
-	return new_header;
-}
-
-// Bitmap data type functions
-
-static const char* _al_datafile_bitmap_name(void)
-{
-	static const char* name = "BITMAP";
-
-	return name;
-}
-
-static int32_t _al_datafile_bitmap_do_load(ALLEGRO_FILE* file, ALLEGRO_BITMAP** bitmap)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (bitmap == NULL)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return -1;
-	}
-
-	(*bitmap) = al_load_bitmap_f(file, _DATA_BITMAP_IDENTIFIER);
-
-	if (*bitmap == NULL)
-	{
-		DO_LOG("Failed to load bitmap");
-		return -1;
-	}
-
-	return 0;
-}
-
-static void _al_datafile_bitmap_destroy(ALLEGRO_BITMAP* bitmap)
-{
-	if (bitmap != NULL)
-	{
-		al_destroy_bitmap(bitmap);
-	}
-}
-
-static ALLEGRO_BITMAP* _al_datafile_bitmap_load(ALLEGRO_FILE* file)
-{
-	ALLEGRO_BITMAP* bitmap = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-
-	if (bitmap == NULL)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return NULL;
-	}
-
-	if (_al_datafile_bitmap_do_load(file, &bitmap) != 0)
-	{
-		DO_LOG("Failed to load bitmap");
-		_al_datafile_bitmap_destroy(bitmap);
-		bitmap = NULL;
-	}
-
-	return bitmap;
-}
-
-static int32_t  _al_datafile_bitmap_save(ALLEGRO_FILE* file, ALLEGRO_BITMAP* bitmap)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (bitmap == NULL)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return -1;
-	}
-
-	if (!al_save_bitmap_f(file, _DATA_BITMAP_IDENTIFIER, bitmap))
-	{
-		DO_LOG("Failed to save bitmap");
-		return -1;
-	}
-
-	return 0;
-}
-
-static void _al_datafile_bitmap_render(const ALLEGRO_BITMAP* font)
-{
-	if (font != NULL)
-	{
-		// This is a placeholder implementation. You can customize this function to render the bitmap as needed.
-	}
-}
-
-static const ALLEGRO_DATAFILE_TYPE_VTABLE* _al_datafile_bitmap_vtable(void)
-{
-	static const ALLEGRO_DATAFILE_TYPE_VTABLE vtable =
-	{
-		(ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)_al_datafile_bitmap_name,
-		(ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)_al_datafile_bitmap_load,
-		(ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)_al_datafile_bitmap_save,
-		(ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)_al_datafile_bitmap_destroy,
-		(ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)_al_datafile_bitmap_render
-	};
-
-	return &vtable;
-}
-
-// Bitmap array data type functions
-
-static const char* _al_datafile_bitmap_array_name(void)
-{
-	static const char* name = "BITMAP_ARRAY";
-
-	return name;
-}
-
-static bool _al_datafile_is_bitmap_empty(ALLEGRO_BITMAP* bitmap, int32_t width, int32_t height)
-{
-	if (bitmap == NULL)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return true;
-	}
-
-	const ALLEGRO_LOCKED_REGION* locked = al_lock_bitmap(bitmap, ALLEGRO_PIXEL_FORMAT_ANY, ALLEGRO_LOCK_READONLY);
-
-	if (!locked)
-	{
-		DO_LOG("Failed to lock bitmap");
-		return true;
-	}
-
-	for (int32_t y = 0; y < height; y++)
-	{
-		for (int32_t x = 0; x < width; x++)
-		{
-			ALLEGRO_COLOR pixel = al_get_pixel(bitmap, x, y);
-
-			if (pixel.r != 0 || pixel.g != 0 || pixel.b != 0 || pixel.a != 0)
-			{
-				return false;
-			}
-		}
-	}
-
-	al_unlock_bitmap(bitmap);
-
-	return true;
-}
-
-static size_t _al_datafile_calculate_bitmap_array_count(ALLEGRO_BITMAP* bitmap, int32_t width, int32_t height)
-{
-	if (bitmap == NULL)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return 0;
-	}
-
-	size_t count = 0;
-	int32_t w = al_get_bitmap_width(bitmap);
-	int32_t h = al_get_bitmap_height(bitmap);
-	
-	for (int32_t j = 0; j < h; j += height)
-	{
-		for (int32_t i = 0; i < w; i += width)
-		{
-			ALLEGRO_BITMAP* sub_bitmap = al_create_sub_bitmap(bitmap, i, j, width, height);
-			if (!sub_bitmap)
-			{
-				continue;
-			}
-			if (!_al_datafile_is_bitmap_empty(sub_bitmap, width, height))
-			{
-				count++;
-			}
-			al_destroy_bitmap(sub_bitmap);
-		}
-	}
-	return count;
-}
-
-static int32_t _al_datafile_create_bitmap_array(ALLEGRO_BITMAP_ARRAY** bitmap_array, ALLEGRO_BITMAP* bitmap, int32_t width, int32_t height)
-{
-	if (bitmap_array == NULL)
-	{
-		DO_LOG("Invalid bitmap array pointer");
-		return -1;
-	}
-
-	if (bitmap == NULL)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return -1;
-	}
-
-	(*bitmap_array) = (ALLEGRO_BITMAP_ARRAY*)al_malloc(sizeof(ALLEGRO_BITMAP_ARRAY));
-
-	if (!(*bitmap_array))
-	{
-		DO_LOG("Failed to allocate memory for bitmap array");
-		return -1;
-	}
-
-	(*bitmap_array)->bitmap = bitmap;
-	(*bitmap_array)->count = _al_datafile_calculate_bitmap_array_count(bitmap, width, height);
-	(*bitmap_array)->width = width;
-	(*bitmap_array)->height = height;
-	(*bitmap_array)->sub_bitmap = (ALLEGRO_BITMAP**)al_malloc(sizeof(ALLEGRO_BITMAP*) * (*bitmap_array)->count);
-
-	if (!(*bitmap_array)->sub_bitmap)
-	{
-		DO_LOG("Failed to allocate memory for sub bitmaps");
-		return -1;
-	}
-
-	int32_t w = al_get_bitmap_width(bitmap);
-	int32_t h = al_get_bitmap_height(bitmap);
-	size_t index = 0;
-
-	for (int32_t j = 0; j < h; j += height)
-	{
-		for (int32_t i = 0; i < w; i += width)
-		{
-			(*bitmap_array)->sub_bitmap[index] = al_create_sub_bitmap(bitmap, i, j, width, height);
-
-			if (!(*bitmap_array)->sub_bitmap[index])
-			{
-				DO_LOG("Failed to create sub bitmap");
-				return -1;
-			}
-
-			++index;
-		}
-	}
-
-	return 0;
-}
-
-static void _al_datafile_bitmap_array_destroy(ALLEGRO_BITMAP_ARRAY* bitmap_array)
-{
-	if (bitmap_array == NULL)
-	{
-		DO_LOG("Invalid bitmap array pointer");
-		return;
-	}
-
-	if (bitmap_array->sub_bitmap)
-	{
-		for (size_t i = 0; i < bitmap_array->count; i++)
-		{
-			if (bitmap_array->sub_bitmap[i])
-			{
-				al_destroy_bitmap(bitmap_array->sub_bitmap[i]);
-			}
-		}
-
-		al_free(bitmap_array->sub_bitmap);
-	}
-
-	if (bitmap_array->bitmap)
-	{
-		al_destroy_bitmap(bitmap_array->bitmap);
-	}
-
-	al_free(bitmap_array);
-}
-
-static int32_t _al_datafile_bitmap_array_do_load(ALLEGRO_FILE* file, ALLEGRO_BITMAP_ARRAY* bitmap_array)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-	
-	if (bitmap_array == NULL)
-	{
-		DO_LOG("Invalid bitmap array pointer");
-		return -1;
-	}
-
-	bitmap_array->bitmap = _al_datafile_bitmap_load(file);
-
-	if (bitmap_array->bitmap == NULL)
-	{
-		DO_LOG("Failed to load bitmap");
-		return -1;
-	}
-
-	if (_al_datafile_read_uint(file, (uint32_t*)&bitmap_array->width, sizeof(uint32_t)) != 0)
-	{
-		DO_LOG("Failed to read bitmap array width");
-		return -1;
-	}
-
-	if (_al_datafile_read_uint(file, (uint32_t*)&bitmap_array->height, sizeof(uint32_t)) != 0)
-	{
-		DO_LOG("Failed to read bitmap array height");
-		return -1;
-	}
-
-	if (_al_datafile_create_bitmap_array(&bitmap_array, bitmap_array->bitmap, bitmap_array->width, bitmap_array->height) != 0)
-	{
-		DO_LOG("Failed to create bitmap array");
-		return -1;
-	}
-
-	return 0;
-}
-
-static ALLEGRO_BITMAP_ARRAY* _al_datafile_bitmap_array_load(ALLEGRO_FILE* file)
-{
-	ALLEGRO_BITMAP_ARRAY* bitmap_array = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-
-	bitmap_array = (ALLEGRO_BITMAP_ARRAY*)al_malloc(sizeof(ALLEGRO_BITMAP_ARRAY));
-
-	if (bitmap_array == NULL)
-	{
-		DO_LOG("Failed to allocate memory for bitmap array");
-		return NULL;
-	}
-
-	if (_al_datafile_bitmap_array_do_load(file, bitmap_array) != 0)
-	{
-		DO_LOG("Failed to load bitmap array");
-		_al_datafile_bitmap_array_destroy(bitmap_array);
-		bitmap_array = NULL;
-	}
-
-	return bitmap_array;
-}
-
-static int32_t  _al_datafile_bitmap_array_save(ALLEGRO_FILE* file, ALLEGRO_BITMAP_ARRAY* bitmap_array)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");	
-		return -1;
-	}
-
-	if (bitmap_array == NULL)
-	{
-		DO_LOG("Invalid bitmap array pointer");
-		return -1;
-	}
-
-	if (!al_save_bitmap_f(file, _DATA_BITMAP_IDENTIFIER, bitmap_array->bitmap))
-	{
-		DO_LOG("Failed to save bitmap");
-		return -1;
-	}
-
-	if (_al_datafile_write_uint(file, (uint32_t*)&bitmap_array->width, sizeof(uint32_t)) != 0)
-	{
-		DO_LOG("Failed to write bitmap array width");
-		return -1;
-	}
-
-	if (_al_datafile_write_uint(file, (uint32_t*)&bitmap_array->height, sizeof(uint32_t)) != 0)
-	{
-		DO_LOG("Failed to write bitmap array height");
-		return -1;
-	}
-
-	return 0;
-}
-
-static void _al_datafile_bitmap_array_render(const ALLEGRO_BITMAP_ARRAY* font)
-{
-	if (font != NULL)
-	{
-		// This is a placeholder implementation. You can customize this function to render the bitmap array as needed.
-	}
-}
-
-static const ALLEGRO_DATAFILE_TYPE_VTABLE* _al_datafile_bitmap_array_vtable(void)
-{
-	static const ALLEGRO_DATAFILE_TYPE_VTABLE vtable =
-	{
-		(ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)_al_datafile_bitmap_array_name,
-		(ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)_al_datafile_bitmap_array_load,
-		(ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)_al_datafile_bitmap_array_save,
-		(ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)_al_datafile_bitmap_array_destroy,
-		(ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)_al_datafile_bitmap_array_render
-	};
-
-	return &vtable;
-}
-
-// Data type functions
+# Allegro Datafile Addon API Reference
 
-static const char* _al_datafile_data_name(void)
-{
-	static const char* name = "DATA";
+Version: 1.0
 
-	return name;
-}
-
-static void _al_datafile_data_destroy(ALLEGRO_DATA* data)
-{
-	if (data != NULL)
-	{
-		al_free(data);
-	}
-}
-
-static int32_t  _al_datafile_data_do_load(ALLEGRO_FILE* file, ALLEGRO_DATA** data)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (data == NULL)
-	{
-		DO_LOG("Invalid data pointer");
-		return -1;
-	}
-
-	size_t data_size = 0;
-
-	if (_al_datafile_read_uint(file, &data_size, sizeof(size_t)) != 0)
-	{
-		DO_LOG("Failed to read data size");
-		return -1;
-	}
-
-	(*data) = (ALLEGRO_DATA*)al_malloc(sizeof(ALLEGRO_DATA) + data_size);
-
-	if (*data == NULL)
-	{
-		DO_LOG("Failed to allocate memory for data");
-		return -1;
-	}
-
-	(*data)->size = data_size;
-
-	if (al_fread(file, (*data)->data, data_size) != data_size)
-	{
-		DO_LOG("Failed to read data");
-		return -1;
-	}
-
-	return 0;
-}
-
-static ALLEGRO_DATA* _al_datafile_data_load(ALLEGRO_FILE* file)
-{
-	ALLEGRO_DATA* data = NULL;
-	
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-	
-	if (_al_datafile_data_do_load(file, &data) != 0)
-	{
-		DO_LOG("Failed to load data");
-		_al_datafile_data_destroy(data);
-		data = NULL;
-	}
-
-	return data;
-}
-
-static int32_t  _al_datafile_data_save(ALLEGRO_FILE* file, const ALLEGRO_DATA* data)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (data == NULL)
-	{
-		DO_LOG("Invalid data pointer");
-		return -1;
-	}
-
-	if (_al_datafile_write_uint(file, &data->size, sizeof(size_t)) != 0)
-	{
-		DO_LOG("Failed to write data size");
-		return -1;
-	}
-
-	if (al_fwrite(file, data->data, data->size) != data->size)
-	{
-		DO_LOG("Failed to write data");
-		return -1;
-	}
-
-	return 0;
-}
-
-static void _al_datafile_data_render(const ALLEGRO_DATA* data)
-{
-	if (data != NULL)
-	{
-		// This is a placeholder implementation. You can customize this function to render the data as needed.
-	}
-}
-
-static const ALLEGRO_DATAFILE_TYPE_VTABLE* _al_datafile_data_vtable()
-{
-	static const ALLEGRO_DATAFILE_TYPE_VTABLE vtable =
-	{
-		(ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)_al_datafile_data_name,
-		(ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)_al_datafile_data_load,
-		(ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)_al_datafile_data_save,
-		(ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)_al_datafile_data_destroy,
-		(ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)_al_datafile_data_render
-	};
-
-	return &vtable;
-}
-
-// Font data type functions
-
-static const char* _al_datafile_font_name(void)
-{
-	static const char* name = "FONT";
-
-	return name;
-}
-
-static void _d_get_font_data(const ALLEGRO_FONT* font, const int32_t* ranges, size_t* count, int32_t* width, int32_t* height)
-{
-	if (!font)
-	{
-		DO_LOG("Invalid font pointer");
-		return;
-	}
-
-	if (!count)
-	{
-		DO_LOG("Invalid count pointer");
-		return;
-	}
-
-	if (!width)
-	{
-		DO_LOG("Invalid width pointer");
-		return;
-	}
-
-	if (!height)
-	{
-		DO_LOG("Invalid height pointer");
-		return;
-	}
-
-	*count = 0;
-	*width = 0;
-	*height = al_get_font_line_height(font);
-
-	size_t range_max = ((size_t)_DATA_MAX_FONT_RANGES) << 1;
-
-	for (size_t i = 0; i < range_max; i += 2)
-	{
-		int32_t start = ranges[i];
-		int32_t end = ranges[i + 1];
-
-		if (start == 0 && end == 0)
-		{
-			break;
-		}
-
-		for (int32_t c = start; c <= end; ++c)
-		{
-			int32_t char_width = al_get_glyph_width(font, c);
-
-			if (char_width > *width)
-			{
-				*width = char_width;
-			}
-
-			++(*count);
-		}
-	}
-}
-
-static void _d_draw_glyph_to_bitmap(const ALLEGRO_FONT* font, const ALLEGRO_BITMAP* bitmap, int32_t char_code, int32_t x, int32_t y)
-{
-	if (!font)
-	{
-		DO_LOG("Invalid font pointer");
-		return;
-	}
-
-	if (!bitmap)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return;
-	}
-
-	ALLEGRO_USTR* str = al_ustr_newf("%c", char_code);
-
-	if (!str)
-	{
-		DO_LOG("Failed to create string");
-		return;
-	}
-
-	int32_t char_width = al_get_glyph_width(font, char_code);
-	int32_t char_height = al_get_font_line_height(font);
-
-	al_draw_filled_rectangle((float)x, (float)y, (float)(x + char_width), (float)(y + char_height), al_map_rgb(255, 0, 255));
-
-	al_draw_ustr(font, al_map_rgb(255, 255, 255), (float)(x), (float)(y), 0, str);
-
-	al_ustr_free(str);
-}
-
-static void _d_draw_glyph_range_to_bitmap(const ALLEGRO_FONT* font, const ALLEGRO_BITMAP* bitmap, int32_t* index, const int32_t range[2], int32_t chunk_width, int32_t chunk_height)
-{
-	if (!font)
-	{
-		DO_LOG("Invalid font pointer");
-		return;
-	}
-
-	if (!bitmap)
-	{
-		DO_LOG("Invalid bitmap pointer");
-		return;
-	}
-
-	if (!index)
-	{
-		DO_LOG("Invalid index pointer");
-		return;
-	}
-
-	for (int32_t c = range[0]; c <= range[1]; ++c)
-	{
-		int32_t x = (*index % 16) * chunk_width;
-		int32_t y = (*index / 16) * chunk_height;
-
-		_d_draw_glyph_to_bitmap(font, bitmap, c, x + 1, y + 1);
-		++(*index);
-	}
-}
-
-static ALLEGRO_BITMAP* _d_convert_to_bitmap(ALLEGRO_FONT* font)
-{
-	ALLEGRO_BITMAP* bitmap = NULL;
-	int32_t ranges[512] = { 0 };
-	int32_t range_count = 0;
-	int32_t char_width = 0;
-	int32_t char_height = 0;
-	int32_t chunk_width = 0;
-	int32_t chunk_height = 0;
-	size_t count = 0;
-	int32_t index = 0;
-
-	if (!font)
-	{
-		DO_LOG("Invalid font pointer");
-		return NULL;
-	}
-
-	range_count = al_get_font_ranges(font, _DATA_MAX_FONT_RANGES, ranges);
-	_d_get_font_data(font, ranges, &count, &char_width, &char_height);
-
-	chunk_width = (char_width + 0x10) & 0xfffffff0;
-	chunk_height = (char_height + 0x10) & 0xfffffff0;
-
-	int32_t bitmap_width = 1 + (chunk_width << 4);
-	int32_t bitmap_height = 1 + (chunk_height * (int32_t)(count >> 4));
-
-	bitmap = al_create_bitmap(bitmap_width, bitmap_height);
-	if (!bitmap)
-	{
-		DO_LOG("Failed to create bitmap");
-		return NULL;
-	}
-
-	ALLEGRO_BITMAP* previous_target = al_get_target_bitmap();
-	al_set_target_bitmap(bitmap);
-	al_clear_to_color(al_map_rgb(255, 255, 0));
-
-	for (int32_t i = 0; i < range_count; i += 2)
-	{
-		int32_t  char_range[2] = { ranges[i], ranges[i + 1] };
-		_d_draw_glyph_range_to_bitmap(font, bitmap, &index, char_range, chunk_width, chunk_height);
-	}
-
-	al_set_target_bitmap(previous_target);
-
-	return bitmap;
-}
-
-static void _al_datafile_font_destroy(ALLEGRO_FONT* font)
-{
-	if (font != NULL)
-	{
-		al_destroy_font(font);
-	}
-}
-
-static int32_t _al_datafile_font_do_load(ALLEGRO_FILE* file, ALLEGRO_FONT** font)
-{
-	int32_t  ranges[] = { 0x0020, 0x007f };
-	ALLEGRO_BITMAP* bitmap = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (font == NULL)
-	{
-		DO_LOG("Invalid font pointer");
-		return -1;
-	}
-
-	bitmap = _al_datafile_bitmap_load(file);
-
-	if (!bitmap)
-	{
-		DO_LOG("Failed to load bitmap");
-		return -1;
-	}
-
-	ALLEGRO_COLOR mask_color = al_get_pixel(bitmap, 1, 1);
-
-	al_convert_mask_to_alpha(bitmap, mask_color);
-
-	(*font) = al_grab_font_from_bitmap(bitmap, 1, ranges);
-
-	if (*font == NULL)
-	{
-		DO_LOG("Failed to grab font from bitmap");
-		return -1;
-	}
-
-	return 0;
-}
-
-static ALLEGRO_FONT* _al_datafile_font_load(ALLEGRO_FILE* file)
-{
-	ALLEGRO_FONT* font = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-
-	if (_al_datafile_font_do_load(file, &font) != 0)
-	{
-		DO_LOG("Failed to load font");
-		_al_datafile_font_destroy(font);
-		font = NULL;
-	}
-
-	return font;
-}
-
-static int32_t  _al_datafile_font_save(ALLEGRO_FILE* file, ALLEGRO_FONT* font)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (font == NULL)
-	{
-		DO_LOG("Invalid font pointer");
-		return -1;
-	}
-
-	ALLEGRO_BITMAP* bitmap = _d_convert_to_bitmap(font);
-
-	if (!bitmap)
-	{
-		DO_LOG("Failed to convert font to bitmap");
-		return -1;
-	}
-
-	if (_al_datafile_bitmap_save(file, bitmap) != 0)
-	{
-		DO_LOG("Failed to save bitmap");
-		return -1;
-	}
-
-	return 0;
-}
-
-static void _al_datafile_font_render(const ALLEGRO_FONT* font)
-{
-	if (font != NULL)
-	{
-		// This is a placeholder implementation. You can customize this function to render the font as needed.
-	}
-}
-
-static const ALLEGRO_DATAFILE_TYPE_VTABLE* _al_datafile_font_vtable()
-{
-	static const ALLEGRO_DATAFILE_TYPE_VTABLE vtable =
-	{
-		(ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)_al_datafile_font_name,
-		(ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)_al_datafile_font_load,
-		(ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)_al_datafile_font_save,
-		(ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)_al_datafile_font_destroy,
-		(ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)_al_datafile_font_render
-	};
-
-	return &vtable;
-}
-
-// Sample data type functions
-
-static const char* _al_datafile_sample_name(void)
-{
-	static const char* name = "SAMPLE";
-
-	return name;
-}
-
-static void _al_datafile_sample_destroy(ALLEGRO_SAMPLE* sample)
-{
-	if (sample != NULL)
-	{
-		al_destroy_sample(sample);
-	}
-}
-
-static int32_t  _al_datafile_sample_do_load(ALLEGRO_FILE* file, ALLEGRO_SAMPLE** sample)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (sample == NULL)
-	{
-		DO_LOG("Invalid sample pointer");
-		return -1;
-	}
-
-	(*sample) = al_load_sample_f(file, _DATA_SAMPLE_IDENTIFIER);
-
-	if (*sample == NULL)
-	{
-		DO_LOG("Failed to load sample");
-		return -1;
-	}
-
-	return 0;
-}
-
-static ALLEGRO_SAMPLE* _al_datafile_sample_load(ALLEGRO_FILE* file)
-{
-	ALLEGRO_SAMPLE* sample = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-
-	if (_al_datafile_sample_do_load(file, &sample) != 0)
-	{
-		DO_LOG("Failed to load sample");
-		_al_datafile_sample_destroy(sample);
-		sample = NULL;
-	}
-
-	return sample;
-}
-
-static int32_t  _al_datafile_sample_save(ALLEGRO_FILE* file, ALLEGRO_SAMPLE* sample)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (sample == NULL)
-	{
-		DO_LOG("Invalid sample pointer");
-		return -1;
-	}
-
-	if (!al_save_sample_f(file, _DATA_SAMPLE_IDENTIFIER, sample))
-	{
-		DO_LOG("Failed to save sample");
-		return -1;
-	}
-
-	return 0;
-}
-
-static void _al_datafile_sample_render(const ALLEGRO_SAMPLE* sample)
-{
-	if (sample != NULL)
-	{
-		// This is a placeholder implementation. You can customize this function to render the sample as needed.
-	}
-}
-
-static const ALLEGRO_DATAFILE_TYPE_VTABLE* _al_datafile_sample_vtable()
-{
-	static const ALLEGRO_DATAFILE_TYPE_VTABLE vtable =
-	{
-		(ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)_al_datafile_sample_name,
-		(ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)_al_datafile_sample_load,
-		(ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)_al_datafile_sample_save,
-		(ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)_al_datafile_sample_destroy,
-		(ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)_al_datafile_sample_render
-	};
-
-	return &vtable;
-}
-
-// Text data type functions
-
-static const char* _al_datafile_text_name(void)
-{
-	static const char* name = "TEXT";
-
-	return name;
-}
-
-static void _al_datafile_text_destroy(ALLEGRO_USTR* text)
-{
-	if (text != NULL)
-	{
-		al_ustr_free(text);
-	}
-}
+## Table of Contents
 
-static int32_t  _al_datafile_text_do_load(ALLEGRO_FILE* file, ALLEGRO_USTR** text)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (text == NULL)
-	{
-		DO_LOG("Invalid text pointer");
-		return -1;
-	}
-
-	if (_al_datafile_read_string(file, text) != 0)
-	{
-		DO_LOG("Failed to read text");
-		return -1;
-	}
-
-	return 0;
-}
-
-static ALLEGRO_USTR* _al_datafile_text_load(ALLEGRO_FILE* file)
-{
-	ALLEGRO_USTR* text = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-
-	if (_al_datafile_text_do_load(file, &text) != 0)
-	{
-		DO_LOG("Failed to load text");
-		_al_datafile_text_destroy(text);
-		text = NULL;
-	}
-
-	return text;
-}
+- [Overview](#overview)
+- [Datafile Object Types](#datafile-object-types)
+- [Callback Function Types](#callback-function-types)
+- [Data Structures](#data-structures)
+- [Core Functions](#core-functions)
+- [Helper Structures](#helper-structures)
+- [Object Loader Functions](#object-loader-functions)
 
-static int32_t  _al_datafile_text_save(ALLEGRO_FILE* file, const ALLEGRO_USTR* text)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (text == NULL)
-	{
-		DO_LOG("Invalid text pointer");
-		return -1;
-	}
-
-	if (_al_datafile_write_string(file, text) != 0)
-	{
-		DO_LOG("Failed to write text");
-		return -1;
-	}
-
-	return 0;
-}
+---
 
-static void _al_datafile_text_render(const ALLEGRO_USTR* text)
-{
-	if (text != NULL)
-	{
-		// This is a placeholder implementation. You can customize this function to render the text as needed.
-	}
-}
+## Overview
 
-static const ALLEGRO_DATAFILE_TYPE_VTABLE* _al_datafile_text_vtable()
-{
-	static const ALLEGRO_DATAFILE_TYPE_VTABLE vtable =
-	{
-		(ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)_al_datafile_text_name,
-		(ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)_al_datafile_text_load,
-		(ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)_al_datafile_text_save,
-		(ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)_al_datafile_text_destroy,
-		(ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)_al_datafile_text_render
-	};
-
-	return &vtable;
-}
+The Allegro Datafile Addon provides functionality for creating, loading, saving, and managing datafiles - compressed archives that can contain multiple game assets such as bitmaps, fonts, audio samples, and custom data types.
 
-// File data type functions
+### Features
+- Support for multiple asset types (bitmaps, fonts, audio samples, text, raw data)
+- Compressed storage using zlib
+- Extensible type system for custom object types
+- Bitmap arrays for sprite sheets and tile maps
+- Both bitmap and TrueType font support
 
-static const char* _al_datafile_file_name(void)
-{
-	static const char* name = "DATAFILE";
+### Dependencies
+- Allegro 5 core library
+- Allegro font addon
+- Allegro TTF addon
+- Allegro image addon
+- Allegro audio addon
+- Allegro audio codec addon
+- Allegro primitives addon
+- zlib compression library
 
-	return name;
-}
+---
 
-static ALLEGRO_DATAFILE_TYPE_NODE* _al_datafile_type_head_node = NULL;
+## Datafile Object Types
 
-static ALLEGRO_DATAFILE_TYPE_NODE* _al_datafile_type_find_node(uint32_t type)
-{
-	ALLEGRO_DATAFILE_TYPE_NODE* current = _al_datafile_type_head_node;
+Pre-defined constants for identifying different object types stored in datafiles.
 
-	while (current)
-	{
-		if (current->type == type)
-		{
-			return current;
-		}
+### ALLEGRO_DATAFILE_TYPE_BITMAP
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_BITMAP = ((uint32_t)AL_ID('B', 'M', 'P', ' '));
+```
+**Description:** Bitmap object type identifier.
 
-		current = current->next;
-	}
+**Usage:** Use this constant when adding or querying bitmap objects in a datafile.
 
-	return NULL;
-}
+---
 
-static int32_t _al_datafile_read_data(ALLEGRO_FILE* file, const ALLEGRO_DATAFILE_HEADER* header, ALLEGRO_DATAFILE* entries)
-{
-	for (size_t i = 0; i < header->count; ++i)
-	{
-		ALLEGRO_DATAFILE* entry = (entries + i);
-		ALLEGRO_USTR* name = header->names[i];
-
-		if (_al_datafile_read_uint(file, &entry->type, sizeof(uint32_t)) != 0)
-		{
-			DO_LOG("Failed to read entry type");
-			return -1;
-		}
-
-		if (_al_datafile_read_string(file, &name) != 0)
-		{
-			DO_LOG("Failed to read entry name");
-			return -1;
-		}
-
-		const ALLEGRO_DATAFILE_TYPE_NODE* node = _al_datafile_type_find_node(entry->type);
-
-		if (!node || !node->vtable.load)
-		{
-			DO_LOG("Failed to find datafile type node or load function");
-			return -1;
-		}
-
-		entry->data = node->vtable.load(file);
-		
-		if (!entry->data)
-		{
-			DO_LOG("Failed to load entry data");
-			return -1;
-		}
-	}
-
-	return 0;
-}
+### ALLEGRO_DATAFILE_TYPE_BITMAP_ARRAY
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_BITMAP_ARRAY = ((uint32_t)AL_ID('B', 'M', 'P', 'A'));
+```
+**Description:** Bitmap array object type identifier.
 
-static void _al_datafile_file_destroy(ALLEGRO_DATAFILE* datafile)
-{
-	if (datafile == NULL)
-	{
-		DO_LOG("Invalid datafile pointer");
-		return;
-	}
-
-	ALLEGRO_DATAFILE_HEADER* header = (ALLEGRO_DATAFILE_HEADER*)((char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
-	_al_datafile_assert_signature(header);
-
-	_al_datafile_destroy_header(header);
-}
+**Usage:** Use for sprite sheets or tile maps that are divided into a grid.
 
-static int32_t  _al_datafile_file_do_load(ALLEGRO_FILE* file, ALLEGRO_DATAFILE** datafile)
-{
-	ALLEGRO_DATAFILE_HEADER* header = NULL;
-	size_t count = 0;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (datafile == NULL)
-	{
-		DO_LOG("Invalid datafile pointer");
-		return -1;
-	}
-
-	(*datafile) = NULL;
-
-	if (_al_datafile_read_uint(file, &count, sizeof(size_t)) != 0)
-	{
-		DO_LOG("Failed to read datafile count");
-		return -1;
-	}
-
-	header = _al_datafile_create_header(count);
-
-	if (!header)
-	{
-		DO_LOG("Failed to create datafile header");
-		return -1; // Memory allocation failed
-	}
-
-	if (_al_datafile_read_data(file, header, (ALLEGRO_DATAFILE*)(header + 1)) != 0)
-	{
-		DO_LOG("Failed to read datafile entries");
-		_al_datafile_destroy_header(header);
-		return -1; // Failed to load data entries
-	}
-
-	return 0;
-}
+---
 
-static ALLEGRO_DATAFILE* _al_datafile_file_load(ALLEGRO_FILE* file)
-{
-	ALLEGRO_DATAFILE* datafile = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-
-	if (_al_datafile_file_do_load(file, &datafile) != 0)
-	{
-		DO_LOG("Failed to load datafile");
-		_al_datafile_file_destroy(datafile);
-		datafile = NULL;
-	}
-
-	return datafile;
-}
+### ALLEGRO_DATAFILE_TYPE_FONT
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_FONT = ((uint32_t)AL_ID('F', 'O', 'N', 'T'));
+```
+**Description:** Font object type identifier.
 
-static int32_t _al_datafile_write_data(ALLEGRO_FILE* file, const ALLEGRO_DATAFILE_HEADER* header, const ALLEGRO_DATAFILE* entries)
-{
-	for (size_t i = 0; i < header->count; ++i)
-	{
-		const ALLEGRO_DATAFILE* entry = (entries + i);
-		const ALLEGRO_USTR* name = header->names[i];
-
-		if (_al_datafile_write_uint(file, &entry->type, sizeof(uint32_t)) != 0)
-		{
-			DO_LOG("Failed to write entry type");
-			return -1;
-		}
-
-		if (_al_datafile_write_string(file, name) != 0)
-		{
-			DO_LOG("Failed to write entry name");
-			return -1;
-		}
-
-		const ALLEGRO_DATAFILE_TYPE_NODE* node = _al_datafile_type_find_node(entry->type);
-
-		if (!node || !node->vtable.save)
-		{
-			DO_LOG("Failed to find datafile type node or save function");
-			return -1;
-		}
-
-		if (node->vtable.save(file, entry->data) != 0)
-		{
-			DO_LOG("Failed to save entry data");
-			return -1;
-		}
-	}
-
-	return 0;
-}
+**Usage:** Use for both bitmap fonts and TrueType fonts.
 
-static int32_t  _al_datafile_file_save(ALLEGRO_FILE* file, const ALLEGRO_DATAFILE* datafile)
-{
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return -1;
-	}
-
-	if (datafile == NULL)
-	{
-		DO_LOG("Invalid datafile pointer");
-		return -1;
-	}
-
-	const ALLEGRO_DATAFILE_HEADER* header = (const ALLEGRO_DATAFILE_HEADER*)((const char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
-	_al_datafile_assert_signature(header);
-
-	if (_al_datafile_write_uint(file, &header->count, sizeof(size_t)) != 0)
-	{
-		DO_LOG("Failed to write datafile header.");
-		return -1;
-	}
-
-	if (_al_datafile_write_data(file, header, (const ALLEGRO_DATAFILE*)(header + 1)) != 0)
-	{
-		DO_LOG("Failed to write datafile entries.");
-		return -1;
-	}
-
-	return 0;
-}
+---
 
-static void _al_datafile_file_render(const ALLEGRO_DATAFILE* datafile)
-{
-	if (datafile != NULL)
-	{
-		// This is a placeholder implementation. You can customize this function to render the datafile as needed.
-	}
-}
+### ALLEGRO_DATAFILE_TYPE_SAMPLE
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_SAMPLE = ((uint32_t)AL_ID('S', 'A', 'M', 'P'));
+```
+**Description:** Audio sample object type identifier.
 
-static const ALLEGRO_DATAFILE_TYPE_VTABLE* _al_datafile_file_vtable()
-{
-	static const ALLEGRO_DATAFILE_TYPE_VTABLE vtable =
-	{
-		(ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)_al_datafile_file_name,
-		(ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)_al_datafile_file_load,
-		(ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)_al_datafile_file_save,
-		(ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)_al_datafile_file_destroy,
-		(ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)_al_datafile_file_render
-	};
-
-	return &vtable;
-}
+**Usage:** Use for sound effects and music stored as audio samples.
 
-static ALLEGRO_DATAFILE_TYPE_NODE* _al_datafile_type_create_node(uint32_t type, const ALLEGRO_DATAFILE_TYPE_VTABLE* vtable)
-{
-	ALLEGRO_DATAFILE_TYPE_NODE* node = NULL;
-
-	if (!vtable)
-	{
-		DO_LOG("VTable pointer is null.");
-		return NULL;
-	}
-
-	node = (ALLEGRO_DATAFILE_TYPE_NODE*)al_malloc(sizeof(ALLEGRO_DATAFILE_TYPE_NODE));
-
-	if (!node)
-	{
-		DO_LOG("Failed to allocate memory for datafile type node.");
-		return NULL;
-	}
-
-	node->type = type;
-	node->vtable.name = vtable->name;
-	node->vtable.load = vtable->load;
-	node->vtable.save = vtable->save;
-	node->vtable.destroy = vtable->destroy;
-	node->next = NULL;
-	return node;
-}
+---
 
+### ALLEGRO_DATAFILE_TYPE_FILE
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_FILE = ((uint32_t)AL_ID('F', 'I', 'L', 'E'));
+```
+**Description:** Nested datafile object type identifier.
 
-bool al_register_datafile_object_type(uint32_t type, const ALLEGRO_DATAFILE_TYPE_VTABLE* vtable)
-{
-	ALLEGRO_DATAFILE_TYPE_NODE* node = NULL;
+**Usage:** Use for hierarchical datafile structures.
 
-	if (!vtable)
-	{
-		DO_LOG("VTable pointer is null.");
-		return false;
-	}
+---
 
-	node = _al_datafile_type_find_node(type);
+### ALLEGRO_DATAFILE_TYPE_DATA
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_DATA = ((uint32_t)AL_ID('D', 'A', 'T', 'A'));
+```
+**Description:** Raw data object type identifier.
 
-	if (!node)
-	{
-		node = _al_datafile_type_create_node(type, vtable);
+**Usage:** Use for arbitrary binary data.
 
-		if (!node)
-		{
-			DO_LOG("Failed to create datafile type node.");
-			return false;
-		}
+---
 
-		node->next = _al_datafile_type_head_node;
+### ALLEGRO_DATAFILE_TYPE_TEXT
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_TEXT = ((uint32_t)AL_ID('T', 'E', 'X', 'T'));
+```
+**Description:** Text/string object type identifier.
 
-		_al_datafile_type_head_node = node;
-	}
+**Usage:** Use for UTF-8 encoded text strings.
 
-	node->vtable.name = vtable->name;
-	node->vtable.load = vtable->load;
-	node->vtable.save = vtable->save;
-	node->vtable.destroy = vtable->destroy;
+---
 
-	return true;
-}
+### ALLEGRO_DATAFILE_TYPE_UNDEFINED
+```c
+static const uint32_t ALLEGRO_DATAFILE_TYPE_UNDEFINED = ((uint32_t)-1);
+```
+**Description:** Undefined/invalid object type identifier.
 
-uint32_t al_get_datafile_addon_version(void)
-{
-	return ALLEGRO_DATAFILE_VERSION_INT;
-}
+**Usage:** Used to indicate an invalid or uninitialized type.
 
-void al_shutdown_datafile_addon(void)
-{
-	ALLEGRO_DATAFILE_TYPE_NODE* current = _al_datafile_type_head_node;
-	ALLEGRO_DATAFILE_TYPE_NODE* next = NULL;
-
-	while (current)
-	{
-		next = current->next;
-		al_free(current);
-		current = next;
-	}
-
-	_al_datafile_type_head_node = NULL;
-}
+---
 
-bool al_is_datafile_addon_initialized(void)
-{
-	return _al_datafile_type_head_node != NULL;
-}
+## Callback Function Types
 
-bool al_init_datafile_addon(void)
-{
-	if (!al_is_system_installed())
-	{
-		DO_LOG("Allegro system is not installed.");
-		return false;
-	}
-
-	if (!al_is_audio_installed() && !al_install_audio())
-	{
-		DO_LOG("Failed to install audio.");
-		return false;
-	}
-
-	if (!al_is_acodec_addon_initialized() && !al_init_acodec_addon())
-	{
-		DO_LOG("Failed to initialize acodec addon.");
-		return false;
-	}
-
-	if (!al_is_image_addon_initialized() && !al_init_image_addon())
-	{
-		DO_LOG("Failed to initialize image addon.");
-		return false;
-	}
-
-	if (!al_is_font_addon_initialized() && !al_init_font_addon())
-	{
-		DO_LOG("Failed to initialize font addon.");
-		return false;
-	}
-
-	if (!al_is_ttf_addon_initialized() && !al_init_ttf_addon())
-	{
-		DO_LOG("Failed to initialize ttf addon.");
-		return false;
-	}
-
-	if (!al_is_primitives_addon_initialized() && !al_init_primitives_addon())
-	{
-		DO_LOG("Failed to initialize primitives addon.");
-		return false;
-	}
-
-	al_register_datafile_object_type(ALLEGRO_DATAFILE_TYPE_FILE, _al_datafile_file_vtable());
-	al_register_datafile_object_type(ALLEGRO_DATAFILE_TYPE_BITMAP, _al_datafile_bitmap_vtable());
-	al_register_datafile_object_type(ALLEGRO_DATAFILE_TYPE_BITMAP_ARRAY, _al_datafile_bitmap_array_vtable());
-	al_register_datafile_object_type(ALLEGRO_DATAFILE_TYPE_FONT, _al_datafile_font_vtable());
-	al_register_datafile_object_type(ALLEGRO_DATAFILE_TYPE_SAMPLE, _al_datafile_sample_vtable());
-	al_register_datafile_object_type(ALLEGRO_DATAFILE_TYPE_TEXT, _al_datafile_text_vtable());
-	al_register_datafile_object_type(ALLEGRO_DATAFILE_TYPE_DATA, _al_datafile_data_vtable());
-
-	atexit(al_shutdown_datafile_addon);
-
-	return true;
-}
+Function pointer types used for implementing custom object type handlers.
 
-ALLEGRO_DATAFILE* al_create_datafile(void)
-{
-	ALLEGRO_DATAFILE_HEADER* header = _al_datafile_create_header(ALLEGRO_DATAFILE_INITIAL_CAPACITY);
+### ALLEGRO_DATAFILE_TYPE_NAMER_FUNC
+```c
+typedef const char* (*ALLEGRO_DATAFILE_TYPE_NAMER_FUNC)(void);
+```
+**Description:** Function pointer type for getting the name of a datafile object type.
 
-	if (!header)
-	{
-		DO_LOG("Failed to create datafile header.");
-		return NULL;
-	}
+**Returns:** Pointer to a null-terminated string containing the type name.
 
-	return (ALLEGRO_DATAFILE*)(header + 1);
+**Example:**
+```c
+const char* my_type_name(void) {
+    return "MY_CUSTOM_TYPE";
 }
+```
 
-ALLEGRO_DATAFILE* al_load_datafile(const char* filename)
-{
-	const ALLEGRO_FILE_INTERFACE* previous_interface = NULL;
-	ALLEGRO_FILE* file = NULL;
-	ALLEGRO_DATAFILE* datafile = NULL;
+---
 
-	if (filename == NULL)
-	{
-		DO_LOG("Filename pointer is null.");
-		return NULL;
-	}
+### ALLEGRO_DATAFILE_TYPE_LOADER_FUNC
+```c
+typedef void* (*ALLEGRO_DATAFILE_TYPE_LOADER_FUNC)(ALLEGRO_FILE* f);
+```
+**Description:** Function pointer type for loading a datafile object from a file.
 
-	previous_interface = al_get_new_file_interface();
-	gz_set_interface();
+**Parameters:**
+- `f` - File handle to read from
 
-	file = al_fopen(filename, "rb");
+**Returns:** Pointer to the loaded object, or NULL on failure.
 
-	if (file)
-	{
-		datafile = _al_datafile_file_load(file);
-	}
-
-	al_fclose(file);
-
-	al_set_new_file_interface(previous_interface);
-
-	return datafile;
+**Example:**
+```c
+void* my_type_load(ALLEGRO_FILE* f) {
+    MyType* obj = malloc(sizeof(MyType));
+    al_fread(f, obj, sizeof(MyType));
+    return obj;
 }
+```
 
-void al_destroy_datafile(ALLEGRO_DATAFILE* datafile)
-{
-	if (datafile)
-	{
-		ALLEGRO_DATAFILE_HEADER* header = (ALLEGRO_DATAFILE_HEADER*)((char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
-		_al_datafile_assert_signature(header);
-		_al_datafile_destroy_header(header);
-	}
-}
+---
 
-size_t al_get_datafile_object_count(const ALLEGRO_DATAFILE* datafile)
-{
-	if (!datafile)
-	{
-		DO_LOG("Datafile pointer is null.");
-		return 0;
-	}
-
-	const ALLEGRO_DATAFILE_HEADER* header = (const ALLEGRO_DATAFILE_HEADER*)((const char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
-	_al_datafile_assert_signature(header);
-	return header->count;
-}
+### ALLEGRO_DATAFILE_TYPE_SAVER_FUNC
+```c
+typedef int32_t (*ALLEGRO_DATAFILE_TYPE_SAVER_FUNC)(ALLEGRO_FILE* f, void* data);
+```
+**Description:** Function pointer type for saving a datafile object to a file.
 
-const char* al_get_datafile_name(const ALLEGRO_DATAFILE* datafile, size_t index)
-{
-	if (!datafile)
-	{
-		DO_LOG("Datafile pointer is null.");
-		return NULL;
-	}
-	
-	const ALLEGRO_DATAFILE_HEADER* header = (const ALLEGRO_DATAFILE_HEADER*)((const char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
-	
-	_al_datafile_assert_signature(header);
-	
-	if (index >= header->count)
-	{
-		DO_LOG("Index out of bounds.");
-		return NULL;
-	}
-
-	return al_cstr(header->names[index]);
-}
+**Parameters:**
+- `f` - File handle to write to
+- `data` - Pointer to the object to save
 
-int32_t al_add_datafile_object(ALLEGRO_DATAFILE** datafile, uint32_t type, const char* name, void* data)
-{
-	if (!datafile)
-	{
-		DO_LOG("Datafile pointer is null.");
-		return -1;
-	}
-
-	if (!name)
-	{
-		DO_LOG("Name pointer is null.");
-		return -1;
-	}
-
-	if (!data)
-	{
-		DO_LOG("Data pointer is null.");
-		return -1;
-	}
-
-	ALLEGRO_DATAFILE_HEADER* header = (ALLEGRO_DATAFILE_HEADER*)((char*)datafile - sizeof(ALLEGRO_DATAFILE_HEADER));
-	_al_datafile_assert_signature(header);
-
-	if (header->count >= header->capacity)
-	{
-		header = _al_resize_datafile_header(header);
-
-		if (!header)
-		{
-			DO_LOG("Failed to resize datafile header.");
-			return -1; // Memory allocation failed
-		}
-
-		*datafile = (ALLEGRO_DATAFILE*)(header + 1);
-	}
-
-	size_t index = header->count;
-	ALLEGRO_DATAFILE* object = (ALLEGRO_DATAFILE*)(header + 1) + index;
-	ALLEGRO_USTR** object_name = (header->names + index);
-
-	header->count++;
-
-	object->type = type;
-	object->data = data;
-	*object_name = al_ustr_new(name);
-
-	if (!*object_name)
-	{
-		DO_LOG("Failed to create object name string.");
-		return -1; // Memory allocation failed
-	}
-
-	return 0;
-}
+**Returns:** 0 on success, -1 on failure.
 
-int32_t al_add_datafile_file_object_args(ALLEGRO_DATAFILE** datafile, uint32_t type, const char* name, const char* filename, const ALLEGRO_DATAFILE_OBJECT_LOADER_ARGS_FUNC loader, const void* args)
-{
-	ALLEGRO_FILE* file = NULL;
-	void* data = NULL;
-
-	if (!datafile)
-	{
-		DO_LOG("Datafile pointer is null.");
-		return -1;
-	}
-
-	if (!name)
-	{
-		DO_LOG("Name pointer is null.");
-		return -1;
-	}
-
-	if (!filename)
-	{
-		DO_LOG("Filename pointer is null.");
-		return -1;
-	}
-
-	file = al_fopen(filename, "rb");
-
-	if (!file)
-	{
-		DO_LOG("Failed to open file: %s", filename);
-		return -1; // Failed to open file
-	}
-
-	data = loader(file, args);
-
-	al_fclose(file);
-
-	if (!data)
-	{
-		DO_LOG("Failed to load data from file: %s", filename);
-		return -1; // Failed to load data
-	}
-
-	return al_add_datafile_object(datafile, type, name, data);
+**Example:**
+```c
+int32_t my_type_save(ALLEGRO_FILE* f, void* data) {
+    MyType* obj = (MyType*)data;
+    return al_fwrite(f, obj, sizeof(MyType)) == sizeof(MyType) ? 0 : -1;
 }
-
+```
 
-int32_t al_add_datafile_file_object(ALLEGRO_DATAFILE** datafile, uint32_t type, const char* name, const char* filename, const ALLEGRO_DATAFILE_OBJECT_LOADER_FUNC loader)
-{
-	ALLEGRO_FILE* file = NULL;
-	void* data = NULL;
+---
 
-	if (!datafile)
-	{
-		DO_LOG("Datafile pointer is null.");
-		return -1;
-	}
+### ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC
+```c
+typedef int32_t (*ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC)(void* data);
+```
+**Description:** Function pointer type for destroying/freeing a datafile object.
 
-	if (!name)
-	{
-		DO_LOG("Name pointer is null.");
-		return -1;
-	}
+**Parameters:**
+- `data` - Pointer to the object to destroy
 
-	if (!filename)
-	{
-		DO_LOG("Filename pointer is null.");
-		return -1;
-	}
+**Returns:** 0 on success, -1 on failure.
 
-	file = al_fopen(filename, "rb");
-
-	if (!file)
-	{
-		DO_LOG("Failed to open file: %s", filename);
-		return -1; // Failed to open file
-	}
-
-	data = loader(file);
-
-	al_fclose(file);
-
-	if (!data)
-	{
-		DO_LOG("Failed to load data from file: %s", filename);
-		return -1; // Failed to load data
-	}
-
-	return al_add_datafile_object(datafile, type, name, data);
-}
-
-ALLEGRO_BITMAP* al_load_datafile_bitmap_f(ALLEGRO_FILE* file, const char* identifier)
-{
-	ALLEGRO_BITMAP* bitmap = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("File pointer is null.");
-		return NULL;
-	}
-
-	if (identifier)
-	{
-		bitmap = al_load_bitmap_f(file, identifier);
-	}
-	else
-	{
-		const char* file_identifier = al_identify_bitmap_f(file);
-
-		if (file_identifier == NULL)
-		{
-			DO_LOG("File is not a valid bitmap.");
-			return NULL;
-		}
-
-		bitmap = al_load_bitmap_f(file, file_identifier);
-	}
-
-	if (bitmap == NULL)
-	{
-		DO_LOG("Failed to load bitmap from file.");
-		return NULL; // Failed to load bitmap
-	}
-
-	return bitmap;
+**Example:**
+```c
+int32_t my_type_destroy(void* data) {
+    MyType* obj = (MyType*)data;
+    // Clean up any internal resources
+    free(obj);
+    return 0;
 }
+```
 
-ALLEGRO_BITMAP_ARRAY* al_load_datafile_bitmap_array_f(ALLEGRO_FILE* file, const ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA* args)
-{
-	ALLEGRO_BITMAP_ARRAY* bitmap_array = NULL;
-	ALLEGRO_BITMAP* bitmap = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Invalid file pointer");
-		return NULL;
-	}
-
-	if (args == NULL)
-	{
-		DO_LOG("Invalid arguments pointer");
-		return NULL;
-	}
-
-	bitmap = al_load_datafile_bitmap_f(file, args->identifier);
-
-	if (bitmap == NULL)
-	{
-		DO_LOG("Failed to load bitmap");
-		return NULL;
-	}
-
-	if (_al_datafile_create_bitmap_array(&bitmap_array, bitmap, args->width, args->height) != 0)
-	{
-		DO_LOG("Failed to create bitmap array");
-		_al_datafile_bitmap_array_destroy(bitmap_array);
-		return NULL;
-	}
-
-	return bitmap_array;
-}
-
-ALLEGRO_SAMPLE* al_load_datafile_sample_f(ALLEGRO_FILE* file, const char* identifier)
-{
-	ALLEGRO_SAMPLE* sample = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("File pointer is null.");
-		return NULL;
-	}
-	
-	if (identifier)
-	{
-		sample = al_load_sample_f(file, identifier);
-	}
-	else
-	{
-		const char* file_identifier = al_identify_sample_f(file);
-		if (file_identifier == NULL)
-		{
-			DO_LOG("File is not a valid sample.");
-			return NULL;
-		}
-		sample = al_load_sample_f(file, file_identifier);
-	}
-	
-	if (sample == NULL)
-	{
-		DO_LOG("Failed to load sample from file.");
-		return NULL; // Failed to load sample
-	}
-	
-	return sample;
-}
-
-ALLEGRO_FONT* al_load_datafile_bitmap_font_f(ALLEGRO_FILE* file, const ALLEGRO_DATAFILE_BITMAP_FONT_DATA* args)
-{
-	ALLEGRO_FONT* font = NULL;
-	ALLEGRO_BITMAP* bitmap = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("Filename pointer is null.");
-		return NULL;
-	}
-
-	if (args == NULL)
-	{
-		DO_LOG("Arguments pointer is null.");
-		return NULL;
-	}
-
-	bitmap = al_load_datafile_bitmap_f(file, args->identifier);
-
-	if (bitmap == NULL)
-	{
-		DO_LOG("Failed to load bitmap for font.");
-		return NULL;
-	}
-
-	font = al_grab_font_from_bitmap(bitmap, args->range_count, args->ranges);
-
-	if (font == NULL)
-	{
-		DO_LOG("Failed to load bitmap font from file.");
-		return NULL; // Failed to load bitmap font
-	}
-
-	return font;
-}
-
-ALLEGRO_FONT* al_load_datafile_ttf_font_f(ALLEGRO_FILE* file, const ALLEGRO_DATAFILE_TTF_FONT_DATA* args)
-{
-	ALLEGRO_FONT* font = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("File pointer is null.");
-		return NULL;
-	}
-	
-	if (args == NULL)
-	{
-		DO_LOG("Font data pointer is null.");
-		return NULL;
-	}
-
-	if (args->filename == NULL)
-	{
-		DO_LOG("Font filename pointer is null.");
-		return NULL;
-	}
-
-	font = al_load_ttf_font_f(file, args->filename, args->size, args->flags);
-	
-	if (!font)
-	{
-		DO_LOG("Failed to load TTF font from file.");
-		return NULL; // Failed to load TTF font
-	}
-
-	return font;
-}
+---
 
-ALLEGRO_USTR* al_load_datafile_text_f(ALLEGRO_FILE* file)
-{
-	ALLEGRO_DATA* data = NULL;
+### ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC
+```c
+typedef int32_t (*ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC)(void* data);
+```
+**Description:** Function pointer type for rendering a datafile object.
 
-	if (file == NULL)
-	{
-		DO_LOG("File pointer is null.");
-		return NULL;
-	}
+**Parameters:**
+- `data` - Pointer to the object to render
 
-	data = al_load_datafile_data_f(file);
+**Returns:** 0 on success, -1 on failure.
+
+---
+
+### ALLEGRO_DATAFILE_OBJECT_LOADER_FUNC
+```c
+typedef void* (*ALLEGRO_DATAFILE_OBJECT_LOADER_FUNC)(ALLEGRO_FILE* file);
+```
+**Description:** Function pointer type for loading an object from a file without additional arguments.
+
+**Parameters:**
+- `file` - File handle to read from
+
+**Returns:** Pointer to the loaded object, or NULL on failure.
+
+---
+
+### ALLEGRO_DATAFILE_OBJECT_LOADER_ARGS_FUNC
+```c
+typedef void* (*ALLEGRO_DATAFILE_OBJECT_LOADER_ARGS_FUNC)(ALLEGRO_FILE* file, const void* data);
+```
+**Description:** Function pointer type for loading an object from a file with additional arguments.
+
+**Parameters:**
+- `file` - File handle to read from
+- `data` - Pointer to additional arguments/configuration data
+
+**Returns:** Pointer to the loaded object, or NULL on failure.
+
+---
+
+## Data Structures
+
+### ALLEGRO_DATAFILE_TYPE_VTABLE
+```c
+typedef struct ALLEGRO_DATAFILE_TYPE_VTABLE {
+    ALLEGRO_DATAFILE_TYPE_NAMER_FUNC name;
+    ALLEGRO_DATAFILE_TYPE_LOADER_FUNC load;
+    ALLEGRO_DATAFILE_TYPE_SAVER_FUNC save;
+    ALLEGRO_DATAFILE_TYPE_DESTROYER_FUNC destroy;
+    ALLEGRO_DATAFILE_TYPE_RENDERER_FUNC render;
+} ALLEGRO_DATAFILE_TYPE_VTABLE;
+```
+**Description:** Virtual function table for datafile object type handlers. This structure defines the operations that can be performed on a specific datafile object type.
+
+**Members:**
+- `name` - Function to get the type name
+- `load` - Function to load the object
+- `save` - Function to save the object
+- `destroy` - Function to destroy the object
+- `render` - Function to render the object
+
+**Example:**
+```c
+static const ALLEGRO_DATAFILE_TYPE_VTABLE my_vtable = {
+    my_type_name,
+    my_type_load,
+    my_type_save,
+    my_type_destroy,
+    my_type_render
+};
+```
+
+---
+
+### ALLEGRO_DATA
+```c
+typedef struct ALLEGRO_DATA {
+    size_t size;
+    uint8_t data[];
+} ALLEGRO_DATA;
+```
+**Description:** Container for raw binary data. This structure stores arbitrary binary data with a size field followed by the actual data bytes in a flexible array member.
+
+**Members:**
+- `size` - Size of the data in bytes
+- `data` - Flexible array member containing the actual data
+
+**Usage:**
+```c
+ALLEGRO_DATA* raw_data = al_load_datafile_data_f(file);
+printf("Data size: %zu bytes\n", raw_data->size);
+// Access data: raw_data->data[0], raw_data->data[1], etc.
+```
+
+---
+
+### ALLEGRO_BITMAP_ARRAY
+```c
+typedef struct ALLEGRO_BITMAP_ARRAY {
+    ALLEGRO_BITMAP* bitmap;
+    ALLEGRO_BITMAP** sub_bitmap;
+    size_t count;
+    int32_t width;
+    int32_t height;
+} ALLEGRO_BITMAP_ARRAY;
+```
+**Description:** Container for an array of bitmap sub-regions. This structure represents a bitmap that has been subdivided into a grid of smaller sub-bitmaps, useful for sprite sheets or tile maps.
+
+**Members:**
+- `bitmap` - The source bitmap containing all sub-bitmaps
+- `sub_bitmap` - Array of pointers to sub-bitmap regions
+- `count` - Number of sub-bitmaps in the array
+- `width` - Width of each sub-bitmap in pixels
+- `height` - Height of each sub-bitmap in pixels
+
+**Example:**
+```c
+ALLEGRO_BITMAP_ARRAY* sprites = /* load bitmap array */;
+// Draw the 5th sprite
+al_draw_bitmap(sprites->sub_bitmap[4], x, y, 0);
+```
+
+---
+
+### ALLEGRO_DATAFILE
+```c
+typedef struct ALLEGRO_DATAFILE {
+    void* data;
+    uint32_t type;
+} ALLEGRO_DATAFILE;
+```
+**Description:** Container for a single datafile object entry. This structure represents one object stored in a datafile, containing a pointer to the data and its type identifier.
+
+**Members:**
+- `data` - Pointer to the actual object data
+- `type` - Type identifier (e.g., ALLEGRO_DATAFILE_TYPE_BITMAP)
+
+**Example:**
+```c
+ALLEGRO_DATAFILE* datafile = al_load_datafile("assets.dat");
+// Access first object
+if (datafile[0].type == ALLEGRO_DATAFILE_TYPE_BITMAP) {
+    ALLEGRO_BITMAP* bmp = (ALLEGRO_BITMAP*)datafile[0].data;
+    al_draw_bitmap(bmp, 0, 0, 0);
+}
+```
+
+---
+
+## Core Functions
+
+### al_get_datafile_addon_version
+```c
+uint32_t al_get_datafile_addon_version(void);
+```
+**Description:** Gets the version number of the datafile addon.
+
+**Returns:** Version number as a 32-bit unsigned integer.
+
+**Example:**
+```c
+uint32_t version = al_get_datafile_addon_version();
+printf("Datafile addon version: 0x%08X\n", version);
+```
+
+---
+
+### al_is_datafile_addon_initialized
+```c
+bool al_is_datafile_addon_initialized(void);
+```
+**Description:** Checks if the datafile addon has been initialized.
+
+**Returns:** true if initialized, false otherwise.
+
+**Example:**
+```c
+if (!al_is_datafile_addon_initialized()) {
+    al_init_datafile_addon();
+}
+```
+
+---
+
+### al_init_datafile_addon
+```c
+bool al_init_datafile_addon(void);
+```
+**Description:** Initializes the datafile addon. This function must be called before using any other datafile functions. It initializes all required Allegro subsystems and registers default object types.
 
-	if (!data)
-	{
-		DO_LOG("Failed to load data from file.");
-		return NULL;
-	}
+**Returns:** true on success, false on failure.
+
+**Example:**
+```c
+if (!al_init_allegro(ALLEGRO_VERSION_INT)) {
+    return -1;
+}
+if (!al_init_datafile_addon()) {
+    fprintf(stderr, "Failed to initialize datafile addon\n");
+    return -1;
+}
+```
+
+---
+
+### al_shutdown_datafile_addon
+```c
+void al_shutdown_datafile_addon(void);
+```
+**Description:** Shuts down the datafile addon and frees all resources. After calling this function, the addon must be reinitialized before use.
+
+**Example:**
+```c
+al_shutdown_datafile_addon();
+```
+
+---
 
-	ALLEGRO_USTR* text = al_ustr_new_from_buffer(data->data, data->size);
+### al_register_datafile_object_type
+```c
+bool al_register_datafile_object_type(uint32_t type, const ALLEGRO_DATAFILE_TYPE_VTABLE* vtable);
+```
+**Description:** Registers a custom datafile object type handler. This allows you to add support for custom object types in datafiles.
+
+**Parameters:**
+- `type` - The type identifier for this object type (use AL_ID macro)
+- `vtable` - Pointer to the virtual function table defining the type's operations
+
+**Returns:** true on success, false on failure.
+
+**Example:**
+```c
+#define MY_CUSTOM_TYPE AL_ID('M','Y','T','P')
+
+static const ALLEGRO_DATAFILE_TYPE_VTABLE my_vtable = {
+    my_type_name,
+    my_type_load,
+    my_type_save,
+    my_type_destroy,
+    my_type_render
+};
+
+al_register_datafile_object_type(MY_CUSTOM_TYPE, &my_vtable);
+```
 
-	al_free(data);
+---
 
-	if (!text)
-	{
-		DO_LOG("Failed to create text string from data.");
-		return NULL; // Failed to create text string
-	}
+### al_create_datafile
+```c
+ALLEGRO_DATAFILE* al_create_datafile(void);
+```
+**Description:** Creates a new empty datafile.
 
-	return text;
+**Returns:** Pointer to the new datafile, or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_DATAFILE* datafile = al_create_datafile();
+if (!datafile) {
+    fprintf(stderr, "Failed to create datafile\n");
+    return -1;
 }
+```
+
+---
+
+### al_load_datafile
+```c
+ALLEGRO_DATAFILE* al_load_datafile(const char* filename);
+```
+**Description:** Loads a datafile from disk. The file can be compressed or uncompressed. This function automatically handles decompression if needed.
 
-ALLEGRO_DATA* al_load_datafile_data_f(ALLEGRO_FILE* file)
-{
-	ALLEGRO_DATA* data = NULL;
-
-	if (file == NULL)
-	{
-		DO_LOG("File pointer is null.");
-		return NULL;
-	}
-
-	// Get the file size
-	int64_t file_size = al_fsize(file);
-
-	if (file_size <= 0)
-	{
-		DO_LOG("Failed to get file size.");
-		al_fclose(file);
-		return NULL;
-	}
-
-	// Allocate memory for the data
-	data = (ALLEGRO_DATA*)al_malloc(sizeof(ALLEGRO_DATA) + file_size);
-
-	if (!data)
-	{
-		DO_LOG("Failed to allocate memory for data.");
-		return NULL;
-	}
-
-	data->size = file_size;
-
-	// Read the file into the data buffer
-	if (al_fread(file, data->data, file_size) != file_size)
-	{
-		DO_LOG("Failed to read file.");
-		al_free(data);
-		return NULL;
-	}
-
-	al_fclose(file);
-
-	return data;
-}
+**Parameters:**
+- `filename` - Path to the datafile to load
+
+**Returns:** Pointer to the loaded datafile, or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_DATAFILE* datafile = al_load_datafile("assets.dat");
+if (!datafile) {
+    fprintf(stderr, "Failed to load datafile\n");
+    return -1;
+}
+```
+
+---
+
+### al_destroy_datafile
+```c
+void al_destroy_datafile(ALLEGRO_DATAFILE* datafile);
+```
+**Description:** Destroys a datafile and frees all associated resources. This function will call the appropriate destroy callback for each object stored in the datafile.
+
+**Parameters:**
+- `datafile` - Pointer to the datafile to destroy
+
+**Example:**
+```c
+al_destroy_datafile(datafile);
+datafile = NULL;
+```
+
+---
+
+### al_get_datafile_object_count
+```c
+size_t al_get_datafile_object_count(const ALLEGRO_DATAFILE* datafile);
+```
+**Description:** Gets the number of objects stored in a datafile.
+
+**Parameters:**
+- `datafile` - Pointer to the datafile
+
+**Returns:** Number of objects in the datafile, or 0 if datafile is NULL.
+
+**Example:**
+```c
+size_t count = al_get_datafile_object_count(datafile);
+printf("Datafile contains %zu objects\n", count);
+```
+
+---
+
+### al_get_datafile_name
+```c
+const char* al_get_datafile_name(const ALLEGRO_DATAFILE* datafile, size_t index);
+```
+**Description:** Gets the name of an object in the datafile by index.
+
+**Parameters:**
+- `datafile` - Pointer to the datafile
+- `index` - Index of the object (0-based)
+
+**Returns:** Pointer to the object's name string, or NULL on failure.
+
+**Example:**
+```c
+for (size_t i = 0; i < al_get_datafile_object_count(datafile); i++) {
+    const char* name = al_get_datafile_name(datafile, i);
+    printf("Object %zu: %s\n", i, name);
+}
+```
+
+---
+
+### al_add_datafile_object
+```c
+int32_t al_add_datafile_object(ALLEGRO_DATAFILE** datafile, uint32_t type, const char* name, void* data);
+```
+**Description:** Adds an object to a datafile. Note: This function may reallocate the datafile structure, so always use the pointer passed by reference.
+
+**Parameters:**
+- `datafile` - Pointer to pointer to the datafile (may be modified)
+- `type` - Type identifier for the object
+- `name` - Name/identifier for the object
+- `data` - Pointer to the object data
+
+**Returns:** 0 on success, -1 on failure.
+
+**Example:**
+```c
+ALLEGRO_BITMAP* bmp = al_load_bitmap("sprite.png");
+if (al_add_datafile_object(&datafile, ALLEGRO_DATAFILE_TYPE_BITMAP, "hero_sprite", bmp) != 0) {
+    fprintf(stderr, "Failed to add object\n");
+}
+```
+
+---
+
+### al_add_datafile_file_object
+```c
+int32_t al_add_datafile_file_object(ALLEGRO_DATAFILE** datafile, uint32_t type, 
+                                     const char* name, const char* filename, 
+                                     const ALLEGRO_DATAFILE_OBJECT_LOADER_FUNC loader);
+```
+**Description:** Loads an object from a file and adds it to the datafile.
+
+**Parameters:**
+- `datafile` - Pointer to pointer to the datafile (may be modified)
+- `type` - Type identifier for the object
+- `name` - Name/identifier for the object
+- `filename` - Path to the file containing the object
+- `loader` - Function to use for loading the object
+
+**Returns:** 0 on success, -1 on failure.
+
+**Example:**
+```c
+al_add_datafile_file_object(&datafile, ALLEGRO_DATAFILE_TYPE_BITMAP, 
+                            "background", "bg.png", 
+                            (ALLEGRO_DATAFILE_OBJECT_LOADER_FUNC)al_load_datafile_bitmap_f);
+```
+
+---
+
+### al_add_datafile_file_object_args
+```c
+int32_t al_add_datafile_file_object_args(ALLEGRO_DATAFILE** datafile, uint32_t type, 
+                                          const char* name, const char* filename, 
+                                          const ALLEGRO_DATAFILE_OBJECT_LOADER_ARGS_FUNC loader, 
+                                          const void* args);
+```
+**Description:** Loads an object from a file with additional arguments and adds it to the datafile.
+
+**Parameters:**
+- `datafile` - Pointer to pointer to the datafile (may be modified)
+- `type` - Type identifier for the object
+- `name` - Name/identifier for the object
+- `filename` - Path to the file containing the object
+- `loader` - Function to use for loading the object
+- `args` - Pointer to additional arguments for the loader function
+
+**Returns:** 0 on success, -1 on failure.
+
+**Example:**
+```c
+ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA args = {".png", 32, 32};
+al_add_datafile_file_object_args(&datafile, ALLEGRO_DATAFILE_TYPE_BITMAP_ARRAY,
+                                  "tiles", "tileset.png",
+                                  (ALLEGRO_DATAFILE_OBJECT_LOADER_ARGS_FUNC)al_load_datafile_bitmap_array_f,
+                                  &args);
+```
+
+---
+
+## Helper Structures
+
+### ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA
+```c
+typedef struct ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA {
+    const char* identifier;
+    int32_t width;
+    int32_t height;
+} ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA;
+```
+**Description:** Configuration data for loading bitmap arrays. This structure specifies how to divide a source bitmap into a grid of sub-bitmaps.
+
+**Members:**
+- `identifier` - File format identifier (e.g., ".png")
+- `width` - Width of each sub-bitmap cell
+- `height` - Height of each sub-bitmap cell
+
+**Example:**
+```c
+ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA config = {
+    .identifier = ".png",
+    .width = 32,
+    .height = 32
+};
+```
+
+---
+
+### ALLEGRO_DATAFILE_BITMAP_FONT_DATA
+```c
+typedef struct ALLEGRO_DATAFILE_BITMAP_FONT_DATA {
+    const char* identifier;
+    int range_count;
+    int ranges[];
+} ALLEGRO_DATAFILE_BITMAP_FONT_DATA;
+```
+**Description:** Configuration data for loading bitmap fonts. This structure specifies the character ranges to extract from a bitmap font image.
+
+**Members:**
+- `identifier` - File format identifier (e.g., ".png")
+- `range_count` - Number of character ranges
+- `ranges` - Flexible array of range pairs (start, end)
+
+**Example:**
+```c
+struct {
+    const char* identifier;
+    int range_count;
+    int ranges[2];
+} font_config = {
+    .identifier = ".png",
+    .range_count = 1,
+    .ranges = {32, 127}  // ASCII printable characters
+};
+```
+
+---
+
+### ALLEGRO_DATAFILE_TTF_FONT_DATA
+```c
+typedef struct ALLEGRO_DATAFILE_TTF_FONT_DATA {
+    const char* filename;
+    int size;
+    int flags;
+} ALLEGRO_DATAFILE_TTF_FONT_DATA;
+```
+**Description:** Configuration data for loading TrueType fonts. This structure specifies the parameters for loading a TTF font file.
+
+**Members:**
+- `filename` - Path to the TTF font file
+- `size` - Font size in pixels
+- `flags` - Font loading flags (see Allegro font addon)
+
+**Example:**
+```c
+ALLEGRO_DATAFILE_TTF_FONT_DATA config = {
+    .filename = "arial.ttf",
+    .size = 24,
+    .flags = 0
+};
+```
+
+---
+
+## Object Loader Functions
+
+### al_load_datafile_bitmap_f
+```c
+ALLEGRO_BITMAP* al_load_datafile_bitmap_f(ALLEGRO_FILE* file, const char* identifier);
+```
+**Description:** Loads a bitmap from an open file handle.
+
+**Parameters:**
+- `file` - Open file handle positioned at the bitmap data
+- `identifier` - File format identifier (e.g., ".png", ".bmp")
+
+**Returns:** Pointer to the loaded bitmap, or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_FILE* file = al_fopen("image.png", "rb");
+ALLEGRO_BITMAP* bmp = al_load_datafile_bitmap_f(file, ".png");
+al_fclose(file);
+```
+
+---
+
+### al_load_datafile_bitmap_array_f
+```c
+ALLEGRO_BITMAP_ARRAY* al_load_datafile_bitmap_array_f(ALLEGRO_FILE* file, 
+                                                       const ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA* args);
+```
+**Description:** Loads a bitmap array from an open file handle. This function loads a bitmap and divides it into a grid of sub-bitmaps according to the parameters in the args structure.
+
+**Parameters:**
+- `file` - Open file handle positioned at the bitmap data
+- `args` - Pointer to configuration data specifying grid dimensions
+
+**Returns:** Pointer to the loaded bitmap array, or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_DATAFILE_BITMAP_ARRAY_DATA config = {".png", 32, 32};
+ALLEGRO_FILE* file = al_fopen("sprites.png", "rb");
+ALLEGRO_BITMAP_ARRAY* sprites = al_load_datafile_bitmap_array_f(file, &config);
+al_fclose(file);
+```
+
+---
+
+### al_load_datafile_sample_f
+```c
+ALLEGRO_SAMPLE* al_load_datafile_sample_f(ALLEGRO_FILE* file, const char* identifier);
+```
+**Description:** Loads an audio sample from an open file handle.
+
+**Parameters:**
+- `file` - Open file handle positioned at the sample data
+- `identifier` - File format identifier (e.g., ".wav", ".ogg")
+
+**Returns:** Pointer to the loaded sample, or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_FILE* file = al_fopen("sound.wav", "rb");
+ALLEGRO_SAMPLE* sample = al_load_datafile_sample_f(file, ".wav");
+al_fclose(file);
+```
+
+---
+
+### al_load_datafile_ttf_font_f
+```c
+ALLEGRO_FONT* al_load_datafile_ttf_font_f(ALLEGRO_FILE* file, 
+                                          const ALLEGRO_DATAFILE_TTF_FONT_DATA* args);
+```
+**Description:** Loads a TrueType font from an open file handle.
+
+**Parameters:**
+- `file` - Open file handle positioned at the TTF font data
+- `args` - Pointer to configuration data specifying font size and flags
+
+**Returns:** Pointer to the loaded font, or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_DATAFILE_TTF_FONT_DATA config = {"arial.ttf", 24, 0};
+ALLEGRO_FILE* file = al_fopen("arial.ttf", "rb");
+ALLEGRO_FONT* font = al_load_datafile_ttf_font_f(file, &config);
+al_fclose(file);
+```
+
+---
+
+### al_load_datafile_bitmap_font_f
+```c
+ALLEGRO_FONT* al_load_datafile_bitmap_font_f(ALLEGRO_FILE* file, 
+                                             const ALLEGRO_DATAFILE_BITMAP_FONT_DATA* args);
+```
+**Description:** Loads a bitmap font from an open file handle. This function loads a bitmap containing font glyphs and extracts the specified character ranges.
+
+**Parameters:**
+- `file` - Open file handle positioned at the bitmap font data
+- `args` - Pointer to configuration data specifying character ranges
+
+**Returns:** Pointer to the loaded font, or NULL on failure.
+
+**Example:**
+```c
+struct {
+    const char* identifier;
+    int range_count;
+    int ranges[2];
+} config = {".png", 1, {32, 127}};
+
+ALLEGRO_FILE* file = al_fopen("font.png", "rb");
+ALLEGRO_FONT* font = al_load_datafile_bitmap_font_f(file, 
+                       (ALLEGRO_DATAFILE_BITMAP_FONT_DATA*)&config);
+al_fclose(file);
+```
+
+---
+
+### al_load_datafile_text_f
+```c
+ALLEGRO_USTR* al_load_datafile_text_f(ALLEGRO_FILE* file);
+```
+**Description:** Loads a text string from an open file handle. The text is loaded as a UTF-8 encoded string.
+
+**Parameters:**
+- `file` - Open file handle positioned at the text data
+
+**Returns:** Pointer to the loaded string (ALLEGRO_USTR), or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_FILE* file = al_fopen("text.txt", "rb");
+ALLEGRO_USTR* text = al_load_datafile_text_f(file);
+al_fclose(file);
+
+if (text) {
+    printf("Text: %s\n", al_cstr(text));
+    al_ustr_free(text);
+}
+```
+
+---
+
+### al_load_datafile_data_f
+```c
+ALLEGRO_DATA* al_load_datafile_data_f(ALLEGRO_FILE* file);
+```
+**Description:** Loads raw binary data from an open file handle.
+
+**Parameters:**
+- `file` - Open file handle positioned at the data
+
+**Returns:** Pointer to the loaded data structure, or NULL on failure.
+
+**Example:**
+```c
+ALLEGRO_FILE* file = al_fopen("data.bin", "rb");
+ALLEGRO_DATA* data = al_load_datafile_data_f(file);
+al_fclose(file);
+
+if (data) {
+    printf("Loaded %zu bytes\n", data->size);
+    // Access: data->data[0], data->data[1], etc.
+    al_free(data);
+}
+```
+
+---
+
+## Complete Usage Example
+
+```c
+#include <allegro5/allegro5.h>
+#include "d_datafile.h"
+
+int main(int argc, char** argv) {
+    // Initialize Allegro
+    if (!al_init()) {
+        fprintf(stderr, "Failed to initialize Allegro\n");
+        return -1;
+    }
+    
+    // Initialize datafile addon
+    if (!al_init_datafile_addon()) {
+        fprintf(stderr, "Failed to initialize datafile addon\n");
+        return -1;
+    }
+    
+    // Create a new datafile
+    ALLEGRO_DATAFILE* datafile = al_create_datafile();
+    
+    // Add objects to the datafile
+    ALLEGRO_BITMAP* bmp = al_load_bitmap("hero.png");
+    al_add_datafile_object(&datafile, ALLEGRO_DATAFILE_TYPE_BITMAP, "hero", bmp);
+    
+    ALLEGRO_SAMPLE* sfx = al_load_sample("jump.wav");
+    al_add_datafile_object(&datafile, ALLEGRO_DATAFILE_TYPE_SAMPLE, "jump_sound", sfx);
+    
+    // Save the datafile (implementation needed)
+    // al_save_datafile(datafile, "game_assets.dat");
+    
+    // Load a datafile
+    ALLEGRO_DATAFILE* loaded = al_load_datafile("game_assets.dat");
+    
+    if (loaded) {
+        size_t count = al_get_datafile_object_count(loaded);
+        printf("Loaded %zu objects\n", count);
+        
+        for (size_t i = 0; i < count; i++) {
+            const char* name = al_get_datafile_name(loaded, i);
+            printf("Object %zu: %s (type: 0x%08X)\n", i, name, loaded[i].type);
+        }
+        
+        // Clean up
+        al_destroy_datafile(loaded);
+    }
+    
+    al_destroy_datafile(datafile);
+    al_shutdown_datafile_addon();
+    
+    return 0;
+}
+```
+
+---
+
+## License
+
+This documentation is provided as-is for the Allegro Datafile Addon.
+
+---
+
+*Generated from d_datafile.h comment directives*
